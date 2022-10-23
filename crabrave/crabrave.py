@@ -91,7 +91,7 @@ class CrabRave(commands.Cog):
     @commands.cooldown(1, 20, commands.BucketType.guild)
     @commands.max_concurrency(2, commands.BucketType.default)
     @checks.bot_has_permissions(attach_files=True)
-    async def crab(self, ctx: commands.Context, *, text: Optional[clean_content]):
+    async def rave(self, ctx: commands.Context, *, text: Optional[clean_content]):
         """Make crab rave videos
 
         There must be exactly 1 `,` to split the message
