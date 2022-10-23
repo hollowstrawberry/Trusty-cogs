@@ -126,10 +126,11 @@ class CrabRave(commands.Cog):
             except Exception:
                 log.error("Error sending crabrave video", exc_info=True)
                 pass
-            try:
-                os.remove(fp)
-            except Exception:
-                log.error("Error deleting crabrave video", exc_info=True)
+            if t:
+                try:
+                    os.remove(fp)
+                except Exception:
+                    log.error("Error deleting crabrave video", exc_info=True)
 
     def make_crab(self, t: str, u_id: int) -> bool:
         """Non blocking crab rave video generation from DankMemer bot
@@ -201,10 +202,11 @@ class CrabRave(commands.Cog):
             except Exception:
                 log.error("Error sending mikurave video", exc_info=True)
                 pass
-            try:
-                os.remove(fp)
-            except Exception:
-                log.error("Error deleting mikurave video", exc_info=True)
+            if t:
+                try:
+                    os.remove(fp)
+                except Exception:
+                    log.error("Error deleting mikurave video", exc_info=True)
 
     def make_miku(self, t: str, u_id: int) -> bool:
         """Non blocking miku rave video generation from DankMemer bot
