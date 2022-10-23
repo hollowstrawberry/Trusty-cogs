@@ -98,12 +98,12 @@ class CrabRave(commands.Cog):
         async with ctx.typing():
             t = ctx.message.clean_content[len(f"{ctx.prefix}{ctx.invoked_with}") :]
             t = t.upper().replace(", ", ",").split(",")
+            if len(t) != 2:
+                return await ctx.send("You must submit exactly two strings split by comma")
             if not await self.check_video_file(CRAB_LINK, "crab_template.mp4"):
                 return await ctx.send("I couldn't download the template file.")
             if not await self.check_font_file():
                 return await ctx.send("I couldn't download the font file.")
-            if len(t) != 2:
-                return await ctx.send("You must submit exactly two strings split by comma")
             if (not t[0] and not t[0].strip()) or (not t[1] and not t[1].strip()):
                 return await ctx.send("Cannot render empty text")
             fake_task = functools.partial(self.make_crab, t=t, u_id=ctx.message.id)
@@ -186,12 +186,12 @@ class CrabRave(commands.Cog):
         async with ctx.typing():
             t = ctx.message.clean_content[len(f"{ctx.prefix}{ctx.invoked_with}") :]
             t = t.upper().replace(", ", ",").split(",")
+            if len(t) != 2:
+                return await ctx.send("You must submit exactly two strings split by comma")
             if not await self.check_video_file(MIKU_LINK, "miku_template.mp4"):
                 return await ctx.send("I couldn't download the template file.")
             if not await self.check_font_file():
                 return await ctx.send("I couldn't download the font file.")
-            if len(t) != 2:
-                return await ctx.send("You must submit exactly two strings split by comma")
             if (not t[0] and not t[0].strip()) or (not t[1] and not t[1].strip()):
                 return await ctx.send("Cannot render empty text")
             fake_task = functools.partial(self.make_miku, t=t, u_id=ctx.message.id)
