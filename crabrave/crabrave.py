@@ -49,10 +49,11 @@ class CrabRave(commands.Cog):
     async def check_video_file(self, link: str, name_template: str) -> bool:
         if not (cog_data_path(self) / name_template).is_file():
             try:
+                loop = asyncio.get_running_loop()
                 task = functools.partial(
                     self.dl_from_youtube, link=link, name_template=name_template
                 )
-                task = self.bot.loop.run_in_executor(None, task)
+                task = loop.run_in_executor(None, task)
                 await asyncio.wait_for(task, timeout=60)
             except asyncio.TimeoutError:
                 log.exception("Error downloading the crabrave video")

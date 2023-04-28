@@ -1,7 +1,7 @@
 import asyncio
 import logging
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 import discord
@@ -90,7 +90,7 @@ class Welcome(Events, commands.Cog):
         """
         return
 
-    @tasks.loop(seconds=300)
+    @discord.ext.tasks.loop(seconds=300)
     async def group_welcome(self) -> None:
         # log.debug("Checking for new welcomes")
         for guild_id, members in self.joined.items():
@@ -1014,6 +1014,6 @@ class Welcome(Events, commands.Cog):
             verb = _("on")
         await ctx.send(_("Mentioning the user turned {verb}").format(verb=verb))
 
-    def cog_unload(self):
+    async def cog_unload(self):
         # self.group_check.cancel()
         self.group_welcome.cancel()
