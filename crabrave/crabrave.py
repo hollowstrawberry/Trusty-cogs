@@ -88,28 +88,25 @@ class CrabRave(commands.Cog):
                 return False
         return True
 
-    @commands.command(aliases=["crabrave"])
+    @commands.hybrid_command()
     @commands.cooldown(1, 20, commands.BucketType.guild)
     @commands.max_concurrency(2, commands.BucketType.default)
     @checks.bot_has_permissions(attach_files=True)
-    async def rave(self, ctx: commands.Context, *, text: Optional[clean_content]):
-        """Make crab rave videos
-
-        There must be exactly 1 `,` to split the message
-        """
+    async def crabrave(self, ctx: commands.Context, *, is_gone: clean_content):
+        """Make crab rave videos. You can split the message with a comma."""
         async with ctx.typing():
             if not await self.check_video_file(CRAB_LINK, "crab_template.mp4"):
                 return await ctx.send("I couldn't download the template file.")
             if not await self.check_font_file():
                 return await ctx.send("I couldn't download the font file.")
             
-            t = text.upper().replace(", ", ",").split(",") if text else []
-            t = [txt.strip() for txt in t if txt.strip()]
-            if len(t) == 1:
-                t.append("IS GONE")
+            text = is_gone.upper().split(",") if is_gone else []
+            text = [txt.strip() for txt in text if txt.strip()]
+            if len(text) == 1:
+                text.append("IS GONE")
 
-            if t:
-                fake_task = functools.partial(self.make_crab, t=t, u_id=ctx.message.id)
+            if text:
+                fake_task = functools.partial(self.make_crab, t=text, u_id=ctx.message.id)
                 task = self.bot.loop.run_in_executor(None, fake_task)
                 try:
                     await asyncio.wait_for(task, timeout=300)
@@ -127,7 +124,7 @@ class CrabRave(commands.Cog):
             except Exception:
                 log.error("Error sending crabrave video", exc_info=True)
                 pass
-            if t:
+            if text:
                 try:
                     os.remove(fp)
                 except Exception:
@@ -135,7 +132,6 @@ class CrabRave(commands.Cog):
 
     def make_crab(self, t: str, u_id: int) -> bool:
         """Non blocking crab rave video generation from DankMemer bot
-
         https://github.com/DankMemer/meme-server/blob/master/endpoints/crab.py
         """
         fp = str(cog_data_path(self) / f"Verdana.ttf")
@@ -163,28 +159,25 @@ class CrabRave(commands.Cog):
         video.close()
         return True
 
-    @commands.command(aliases=["mikurave"])
+    @commands.hybrid_command()
     @commands.cooldown(1, 20, commands.BucketType.guild)
     @commands.max_concurrency(2, commands.BucketType.default)
     @checks.bot_has_permissions(attach_files=True)
-    async def miku(self, ctx: commands.Context, *, text: Optional[clean_content]):
-        """Make miku rave videos
-
-        There must be exactly 1 `,` to split the message
-        """
+    async def mikurave(self, ctx: commands.Context, *, is_gone: clean_content):
+        """Make miku rave videos. You can split the message with a comma."""
         async with ctx.typing():
             if not await self.check_video_file(MIKU_LINK, "miku_template.mp4"):
                 return await ctx.send("I couldn't download the template file.")
             if not await self.check_font_file():
                 return await ctx.send("I couldn't download the font file.")
             
-            t = text.upper().replace(", ", ",").split(",") if text else []
-            t = [txt.strip() for txt in t if txt.strip()]
-            if len(t) == 1:
-                t.append("IS GONE")
+            text = is_gone.upper().replace(", ", ",").split(",") if is_gone else []
+            text = [txt.strip() for txt in text if txt.strip()]
+            if len(text) == 1:
+                text.append("IS GONE")
 
-            if t:
-                fake_task = functools.partial(self.make_miku, t=t, u_id=ctx.message.id)
+            if text:
+                fake_task = functools.partial(self.make_miku, t=text, u_id=ctx.message.id)
                 task = self.bot.loop.run_in_executor(None, fake_task)
 
                 try:
@@ -203,7 +196,7 @@ class CrabRave(commands.Cog):
             except Exception:
                 log.error("Error sending mikurave video", exc_info=True)
                 pass
-            if t:
+            if text:
                 try:
                     os.remove(fp)
                 except Exception:
@@ -211,7 +204,6 @@ class CrabRave(commands.Cog):
 
     def make_miku(self, t: str, u_id: int) -> bool:
         """Non blocking miku rave video generation from DankMemer bot
-
         https://github.com/DankMemer/meme-server/blob/master/endpoints/crab.py
         """
         fp = str(cog_data_path(self) / f"Verdana.ttf")
