@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 import discord
+from aiohttp.abc import AbstractMatchInfo
+from red_commons.logging import getLogger
 from redbot.core import Config, commands
 from redbot.core.bot import Red
 from redbot.core.commands import Context
@@ -20,11 +21,11 @@ from .converter import (
 )
 
 if TYPE_CHECKING:
-    from .buttons import ButtonRoleConverter
-    from .select import SelectOptionRoleConverter, SelectRoleConverter
+    from .buttons import ButtonRole, ButtonRoleConverter
+    from .select import SelectOptionRoleConverter, SelectRole, SelectRoleConverter
 
 
-log = logging.getLogger("red.trusty-cogs.ReTrigger")
+log = getLogger("red.trusty-cogs.ReTrigger")
 _ = Translator("Roletools", __file__)
 
 
@@ -41,10 +42,11 @@ class RoleToolsMixin(ABC):
         self.bot: Red
         self.settings: Dict[Any, Any]
         self._ready: asyncio.Event
+        self.views: Dict[int, Dict[str, discord.ui.View]]
 
     @commands.group()
     @commands.guild_only()
-    async def roletools(self: commands.Cog, ctx: Context) -> None:
+    async def roletools(self, ctx: Context) -> None:
         """
         Commands for creating custom role settings
         """
@@ -54,8 +56,8 @@ class RoleToolsMixin(ABC):
     #######################################################################
 
     @abstractmethod
-    def update_cooldown(
-        self, ctx: Context, rate: int, per: float, _type: commands.BucketType
+    async def confirm_selfassignable(
+        self, ctx: commands.Context, roles: List[discord.Role]
     ) -> None:
         raise NotImplementedError()
 
@@ -477,6 +479,17 @@ class RoleToolsMixin(ABC):
     #######################################################################
 
     @abstractmethod
+    async def save_settings(
+        self,
+        guild: discord.Guild,
+        message_key: str,
+        *,
+        buttons: List[ButtonRole] = [],
+        select_menus: List[SelectRole] = [],
+    ):
+        raise NotImplementedError()
+
+    @abstractmethod
     async def send_message(
         self,
         ctx: Context,
@@ -486,6 +499,10 @@ class RoleToolsMixin(ABC):
         *,
         message: str,
     ) -> None:
+        raise NotImplementedError()
+
+    @abstractmethod
+    async def check_and_replace_existing(self, guild_id: int, message_key: str):
         raise NotImplementedError()
 
     @abstractmethod

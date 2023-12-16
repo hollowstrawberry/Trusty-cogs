@@ -1,8 +1,10 @@
-import logging
+from __future__ import annotations
+
 from datetime import datetime
-from typing import Any, List, Optional, Union
+from typing import TYPE_CHECKING, Any, List, Optional, Union
 
 import discord
+from red_commons.logging import getLogger
 from redbot.core import commands
 from redbot.core.i18n import Translator
 from redbot.core.utils.chat_formatting import humanize_list
@@ -10,6 +12,7 @@ from redbot.vendored.discord.ext import menus
 
 from .components import (
     BackButton,
+    BroadcastsButton,
     FilterButton,
     FirstItemButton,
     ForwardButton,
@@ -23,11 +26,15 @@ from .components import (
     StopButton,
 )
 from .errors import NoSchedule
-from .player import Player, SimplePlayer
-from .schedule import Schedule
+from .helper import LeaderboardType
+from .player import SimplePlayer
+from .schedule import Schedule, ScheduleList
+
+if TYPE_CHECKING:
+    from .abc import HockeyMixin
 
 _ = Translator("Hockey", __file__)
-log = logging.getLogger("red.trusty-cogs.hockey")
+log = getLogger("red.trusty-cogs.hockey")
 
 
 class GamesMenu(discord.ui.View):
@@ -55,6 +62,7 @@ class GamesMenu(discord.ui.View):
         self.filter_button = FilterButton(discord.ButtonStyle.primary, 1)
         self.heatmap_button = HeatmapButton(discord.ButtonStyle.primary, 1)
         self.gameflow_button = GameflowButton(discord.ButtonStyle.primary, 1)
+        self.broadcast_button = BroadcastsButton(1)
         self.add_item(self.stop_button)
         self.add_item(self.first_item)
         self.add_item(self.back_button)
@@ -69,6 +77,9 @@ class GamesMenu(discord.ui.View):
             )
             self.add_item(self.heatmap_button)
             self.add_item(self.gameflow_button)
+            self.add_item(self.broadcast_button)
+        if isinstance(self.source, ScheduleList):
+            self.add_item(self.broadcast_button)
         self.select_view: Optional[HockeySelectGame] = None
         self.author = None
 
@@ -176,24 +187,25 @@ class GamesMenu(discord.ui.View):
 
 
 class LeaderboardPages(menus.ListPageSource):
-    def __init__(self, pages: list, style: str):
+    def __init__(self, pages: list, style: LeaderboardType):
         super().__init__(pages, per_page=1)
         self.style = style
 
     def is_paginating(self) -> bool:
         return True
 
-    async def format_page(self, view: discord.ui.View, page: List[str]) -> discord.Embed:
+    async def format_page(self, view: BaseMenu, page: List[str]) -> discord.Embed:
         em = discord.Embed(timestamp=datetime.now())
         description = ""
         for msg in page:
             description += msg
         em.description = description
         em.set_author(
-            name=view.ctx.guild.name + _(" Pickems {style} Leaderboard").format(style=self.style),
-            icon_url=view.ctx.guild.icon.url,
+            name=view.ctx.guild.name
+            + _(" Pickems {style} Leaderboard").format(style=self.style.as_str().title()),
+            icon_url=view.ctx.guild.icon,
         )
-        em.set_thumbnail(url=view.ctx.guild.icon.url)
+        em.set_thumbnail(url=view.ctx.guild.icon)
         em.set_footer(text=f"Page {view.current_page + 1}/{self.get_max_pages()}")
         return em
 
@@ -218,9 +230,9 @@ class PlayerPages(menus.ListPageSource):
     def is_paginating(self) -> bool:
         return True
 
-    async def format_page(self, view: discord.ui.View, player: SimplePlayer) -> discord.Embed:
+    async def format_page(self, view: BaseMenu, player: SimplePlayer) -> discord.Embed:
         # player = await Player.from_id(page, session=view.cog.session)
-        log.debug(player)
+        log.trace("PlayerPages player: %s", player)
         player = await player.get_full_stats(self.season, session=view.cog.session)
         em = player.get_embed()
         em.set_footer(text=f"Page {view.current_page + 1}/{self.get_max_pages()}")
@@ -234,7 +246,7 @@ class SimplePages(menus.ListPageSource):
     def is_paginating(self) -> bool:
         return True
 
-    async def format_page(self, view: discord.ui.View, page: Any) -> Union[discord.Embed, str]:
+    async def format_page(self, view: BaseMenu, page: Any) -> Union[discord.Embed, str]:
         if isinstance(page, discord.Embed):
             page.set_footer(text=f"Page {view.current_page + 1}/{self.get_max_pages()}")
         return page
@@ -245,7 +257,7 @@ class BaseMenu(discord.ui.View):
         self,
         source: menus.PageSource,
         cog: Optional[commands.Cog] = None,
-        page_start: Optional[int] = 0,
+        page_start: int = 0,
         clear_reactions_after: bool = True,
         delete_message_after: bool = False,
         timeout: int = 180,
@@ -253,7 +265,7 @@ class BaseMenu(discord.ui.View):
         **kwargs: Any,
     ) -> None:
         super().__init__(timeout=timeout)
-        self.cog = cog
+        self.cog: HockeyMixin = cog
         self._source = source
         self.ctx: commands.Context = None
         self.message: discord.Message = None

@@ -1,22 +1,56 @@
 from __future__ import annotations
 
-import logging
 import re
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from enum import Enum, EnumMeta
 from typing import List, Optional, Union
 
 import discord
 from discord.ext.commands.converter import Converter
 from discord.ext.commands.errors import BadArgument
+from red_commons.logging import getLogger
 from redbot.core import commands
 from redbot.core.i18n import Translator
 from redbot.core.utils.chat_formatting import humanize_list
 
 _ = Translator("Destiny", __file__)
 
-log = logging.getLogger("red.trusty-cogs.Destiny")
+log = getLogger("red.trusty-cogs.Destiny")
 
 STRING_VAR_RE = re.compile(r"{var:(?P<hash>\d+)}")
+
+
+@dataclass
+class NewsArticle:
+    Title: str
+    Link: str
+    PubDate: str
+    UniqueIdentifier: str
+    Description: str
+    ImagePath: str
+    OptionalMobileImagePath: Optional[str] = None
+
+    def pubdate(self) -> datetime:
+        return datetime.strptime(self.PubDate, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+
+    def save_id(self) -> str:
+        return f"{self.UniqueIdentifier}:{int(self.pubdate().timestamp())}"
+
+
+@dataclass
+class NewsArticles:
+    CurrentPaginationToken: int
+    NextPaginationToken: int
+    ResultCountThisPage: int
+    NewsArticles: List[NewsArticle]
+    PagerAction: str
+    CategoryFilter: Optional[str] = None
+
+    @classmethod
+    def from_json(cls, data: dict) -> NewsArticles:
+        articles = [NewsArticle(**i) for i in data.pop("NewsArticles", [])]
+        return cls(NewsArticles=articles, **data)
 
 
 class DestinyComponentType(Enum):
@@ -162,6 +196,14 @@ class DestinyEnumGroup:
 
     def __iter__(self):
         return self._list
+
+    def add(self, item: Union[Enum, int]):
+        if isinstance(item, int):
+            if self._enum(item) not in self._list:
+                self._list.append(self._enum(item))
+        elif isinstance(item, Enum):
+            if item not in self._list:
+                self._list.append(item)
 
     def to_str(self):
         return ",".join(str(i.value) for i in self._list)
@@ -497,6 +539,69 @@ class StatsPage(discord.app_commands.Transformer):
         return await self.convert(ctx, argument)
 
 
+class DestinyCharacter(discord.app_commands.Transformer):
+    """Returns the selected Character ID for a user"""
+
+    async def convert(self, ctx: commands.Context, argument: str) -> str:
+        cog = ctx.bot.get_cog("Destiny")
+        chars = await cog.config.user(ctx.author).characters()
+        if argument.isdigit():
+            return argument
+        if not chars:
+            try:
+                characters = await cog.get_characters(
+                    ctx.author, components=DestinyComponents(DestinyComponentType.characters)
+                )
+                chars = characters["characters"]["data"]
+                await cog.config.user(ctx.author).characters.set(chars)
+            except Exception as e:
+                await cog.send_error_msg(ctx, e)
+                return
+        for char_id, data in chars.items():
+            if argument.lower() == "titan" and data["classType"] == 0:
+                return char_id
+            if argument.lower() == "hunter" and data["classType"] == 1:
+                return char_id
+            if argument.lower() == "warlock" and data["classType"] == 2:
+                return char_id
+
+    async def autocomplete(
+        self, interaction: discord.Interaction, current: str
+    ) -> List[discord.app_commands.Choice]:
+        cog = interaction.client.get_cog("Destiny")
+        chars = await cog.config.user(interaction.user).characters()
+        class_info = await cog.get_entities("DestinyClassDefinition")
+        if not chars:
+            try:
+                characters = await cog.get_characters(
+                    interaction.user, components=DestinyComponents(DestinyComponentType.characters)
+                )
+                chars = characters["characters"]["data"]
+                await cog.config.user(interaction.user).characters.set(chars)
+            except Exception:
+                return [
+                    discord.app_commands.Choice(
+                        name=_("No characters could be found at this time."), value=""
+                    )
+                ]
+        ret = []
+        for char_id, data in sorted(
+            chars.items(),
+            key=lambda x: datetime.strptime(x[1]["dateLastPlayed"], "%Y-%m-%dT%H:%M:%SZ"),
+            reverse=True,
+        ):
+            name = (
+                class_info.get(str(data["classHash"])).get("displayProperties", {}).get("name", "")
+            )
+            if current.lower() in name.lower():
+                ret.append(discord.app_commands.Choice(name=name, value=char_id))
+        return ret
+
+    async def transform(self, interaction: discord.Interaction, current: str) -> str:
+        ctx = await interaction.client.get_context(interaction)
+        return await self.convert(ctx, current)
+
+
 class SearchInfo(Converter):
     """Returns specific type of information to display with search
     By default we want to list the available perks on the weapon
@@ -508,7 +613,6 @@ class SearchInfo(Converter):
     """
 
     async def convert(self, ctx: commands.Context, argument: str) -> Optional[bool]:
-
         possible_results = {
             "lore": {"code": False, "alt": ["lore"]},
             "details": {

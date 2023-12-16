@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 from typing import Any, List, Optional, Tuple
 
 import discord
 import tekore
+from red_commons.logging import getLogger
 from redbot.core import commands
 from redbot.core.i18n import Translator
 from redbot.core.utils.chat_formatting import box, humanize_list
@@ -40,7 +40,7 @@ from .helpers import (
     spotify_emoji_handler,
 )
 
-log = logging.getLogger("red.Trusty-cogs.spotify")
+log = getLogger("red.Trusty-cogs.spotify")
 _ = Translator("Spotify", __file__)
 
 
@@ -453,7 +453,7 @@ class SpotifyPlaylistsPages(menus.ListPageSource):
         em = discord.Embed(color=discord.Colour(0x1DB954))
         em.set_author(
             name=_("{user}'s Spotify Playlists").format(user=view.author.display_name),
-            icon_url=view.author.avatar.url,
+            icon_url=view.author.display_avatar,
         )
         msg = ""
         for playlist in playlists:
@@ -480,7 +480,7 @@ class SpotifyTopTracksPages(menus.ListPageSource):
         em = discord.Embed(color=discord.Colour(0x1DB954))
         em.set_author(
             name=_("{user}'s Top Tracks").format(user=view.author.display_name),
-            icon_url=view.author.avatar.url,
+            icon_url=view.author.display_avatar,
         )
         msg = ""
         for track in tracks:
@@ -505,7 +505,7 @@ class SpotifyTopArtistsPages(menus.ListPageSource):
         em = discord.Embed(color=discord.Colour(0x1DB954))
         em.set_author(
             name=_("{user}'s Top Artists").format(user=view.author.display_name),
-            icon_url=view.author.avatar.url,
+            icon_url=view.author.display_avatar,
         )
         msg = ""
         for artist in artists:
@@ -539,7 +539,6 @@ class SpotifyPages(menus.PageSource):
         view: discord.ui.View,
         cur_state: Tuple[tekore.model.CurrentlyPlayingContext, bool],
     ) -> discord.Embed:
-
         state = cur_state[0]
         is_liked = cur_state[1]
         self.context = state.context
@@ -570,7 +569,7 @@ class SpotifyPages(menus.PageSource):
             album = f"[{album.name}](https://open.spotify.com/album/{album.id})"
         em.set_author(
             name=f"{view.author.display_name}" + _(" is currently listening to"),
-            icon_url=view.author.avatar.url,
+            icon_url=view.author.display_avatar,
             url=url,
         )
         repeat = (
@@ -667,10 +666,9 @@ class SpotifyPages(menus.PageSource):
                         tracks = [t for t in top_tracks if t is not None]
                     if cur_state.context.type == "collection":
                         cur_tracks = await user_spotify.saved_tracks(limit=50)
-                        cur_tracks.name = _("Saved Tracks")
                         tracks = [t.track for t in cur_tracks.items if t is not None]
                     if cur_tracks:
-                        self.context_name = cur_tracks.name
+                        self.context_name = getattr(cur_tracks, "name", _("Saved Tracks"))
                     for track in tracks:
                         if track.id is not None:
                             self.select_options.append(track)
@@ -872,7 +870,12 @@ class SpotifyUserMenu(discord.ui.View):
             pass
 
     async def on_error(self, error, interaction: discord.Interaction, button: discord.ui.Button):
-        log.debug(f"{error=} {button=} {interaction=}")
+        log.verbose(
+            "SpotifyUserMenu on_error: error=%s button=%s interaction=%s",
+            error,
+            button,
+            interaction,
+        )
 
     async def interaction_check(self, interaction: discord.Interaction):
         """Just extends the default reaction_check to use owner_ids"""
@@ -980,7 +983,7 @@ class SpotifySearchMenu(discord.ui.View):
                 self.source.select_options[page_number - 12 : page_number + 13]
             )
             self.add_item(self.select_view)
-            log.debug(f"changing select {len(self.select_view.options)}")
+            log.trace("changing select %s", len(self.select_view.options))
         self.current_page = page_number
         kwargs = await self._get_kwargs_from_page(page)
         if not interaction.response.is_done():

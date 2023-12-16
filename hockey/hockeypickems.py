@@ -1,10 +1,10 @@
 import asyncio
-import logging
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Union
 
 import discord
 from discord.ext import tasks
+from red_commons.logging import getLogger
 from redbot.core import bank, commands
 from redbot.core.i18n import Translator
 from redbot.core.utils import AsyncIter
@@ -12,14 +12,14 @@ from redbot.core.utils.chat_formatting import pagify
 
 from hockey.helper import utc_to_local
 
-from .abc import MixinMeta
-from .game import Game
+from .abc import HockeyMixin
+from .game import Game, GameState, GameType
 from .pickems import Pickems
 
 _ = Translator("Hockey", __file__)
-log = logging.getLogger("red.trusty-cogs.Hockey")
+log = getLogger("red.trusty-cogs.Hockey")
 
-hockey_commands = MixinMeta.hockey_commands
+hockey_commands = HockeyMixin.hockey_commands
 # defined in abc.py allowing this to be inherited by multiple files
 
 PICKEMS_MESSAGE = _(
@@ -32,7 +32,7 @@ PICKEMS_MESSAGE = _(
 )
 
 
-class HockeyPickems(MixinMeta):
+class HockeyPickems(HockeyMixin):
     """
     Hockey Pickems Logic
     """
@@ -52,7 +52,7 @@ class HockeyPickems(MixinMeta):
             await self.save_pickems_data()
         except Exception:
             log.exception("Error saving pickems data")
-        log.debug("Saved pickems data.")
+        log.verbose("Saved pickems data.")
 
     @commands.Cog.listener()
     async def on_thread_update(self, before: discord.Thread, after: discord.Thread):
@@ -66,10 +66,10 @@ class HockeyPickems(MixinMeta):
             return
         if str(before.id) in await self.pickems_config.guild(guild).pickems_channels():
             await after.edit(archived=False)
-            log.debug("Unarchiving %r", after)
+            log.debug("Unarchiving thread %r", after)
         if before.id in await self.config.guild(guild).gdt():
             await after.edit(archived=False)
-            log.debug("Unarchiving %r", after)
+            log.debug("Unarchiving thread %r", after)
         if (
             before.parent
             and before.parent.id == await self.pickems_config.guild(guild).pickems_channel()
@@ -78,20 +78,20 @@ class HockeyPickems(MixinMeta):
                 return
             if (datetime.now(timezone.utc) - before.created_at) < timedelta(days=9):
                 await after.edit(archived=False)
-                log.debug("Unarchiving %r", after)
+                log.debug("Unarchiving thread %r", after)
 
     async def save_pickems_data(self) -> None:
         to_del: Dict[str, List[str]] = {}
-        # log.debug("Saving pickems data")
+        log.trace("Saving pickems data")
         # all_pickems = self.all_pickems.copy()
         async for guild_id, pickems in AsyncIter(self.all_pickems.items(), steps=10):
             async with self.pickems_config.guild_from_id(int(guild_id)).pickems() as data:
                 for name, pickem in pickems.items():
                     if pickem._should_save:
-                        # log.debug("Saving pickem %r", pickem)
+                        log.trace("Saving pickem %r", pickem)
                         data[name] = pickem.to_json()
                     self.all_pickems[guild_id][name]._should_save = False
-                    if pickem.game_type in ["P", "PR"]:
+                    if pickem.game_type in [GameType.pre_season, GameType.playoffs]:
                         if (datetime.now(timezone.utc) - pickem.game_start) >= timedelta(days=7):
                             del data[name]
                             if guild_id not in to_del:
@@ -106,31 +106,31 @@ class HockeyPickems(MixinMeta):
                 except KeyError:
                     pass
 
-    @pickems_loop.after_loop
     async def after_pickems_loop(self) -> None:
-        log.debug("Cancelling loop")
-        if self.pickems_loop.is_being_cancelled():
-            await self.save_pickems_data()
-            for guild_id, pickems in self.all_pickems.items():
-                for game, pickem in pickems.items():
-                    # Don't forget to remove persistent views when the cog is unloaded.
-                    log.debug(f"Stopping {pickem.name}")
-                    pickem.stop()
+        log.verbose("Saving pickems data and stopping views")
+        await self.save_pickems_data()
+        for guild_id, pickems in self.all_pickems.items():
+            for game, pickem in pickems.items():
+                # Don't forget to remove persistent views when the cog is unloaded.
+                log.trace("Stopping %s", pickem.name)
+                pickem.stop()
 
     @pickems_loop.before_loop
     async def before_pickems_loop(self) -> None:
-        await self.bot.wait_until_ready()
+        log.trace("Waiting for Red to be ready")
+        await self.bot.wait_until_red_ready()
+        log.trace("Waiting for the cog to finish migrating")
         await self._ready.wait()
         # wait until migration if necessary
         all_data = await self.pickems_config.all_guilds()
         for guild_id, data in all_data.items():
             pickems_list = data.get("pickems", {})
             if pickems_list is None:
-                log.info(f"Resetting pickems in {guild_id} for incompatible type")
+                log.info("Resetting pickems in %s for incompatible type", guild_id)
                 await self.pickems_config.guild_from_id(int(guild_id)).pickems.clear()
                 continue
             if type(pickems_list) is list:
-                log.info(f"Resetting pickems in {guild_id} for incompatible type")
+                log.info("Resetting pickems in %S for incompatible type", guild_id)
                 await self.pickems_config.guild_from_id(int(guild_id)).pickems.clear()
                 continue
             # pickems = [Pickems.from_json(p) for p in pickems_list]
@@ -168,10 +168,10 @@ class HockeyPickems(MixinMeta):
         for guild_id, pickems in all_pickems.items():
             guild = self.bot.get_guild(int(guild_id))
             if guild is None:
-                # log.debug("Guild ID %s Not available", guild_id)
+                log.trace("Guild ID %s Not available", guild_id)
                 continue
             if str(game.game_id) not in pickems:
-                # log.debug("Game %r not in pickems", game)
+                log.trace("Game %r not in pickems", game)
                 continue
             pickem = self.all_pickems[str(guild_id)][str(game.game_id)]
             should_edit = pickem.disable_buttons()
@@ -181,7 +181,7 @@ class HockeyPickems(MixinMeta):
                 try:
                     channel_id, message_id = message.split("-")
                 except ValueError:
-                    log.debug("Game %r missing message %s", game, message)
+                    log.verbose("Game %r missing message %s", game, message)
                     continue
                 channel = guild.get_channel_or_thread(int(channel_id))
                 if not channel:
@@ -206,7 +206,7 @@ class HockeyPickems(MixinMeta):
             if not await pickem.check_winner(game):
                 # log.debug("Game %r does not have a winner yet.", game)
                 continue
-            if game.game_state == pickem.game_state:
+            if game.game_state is pickem.game_state:
                 # log.debug("Game state %s not equal to pickem game state %s", game.game_state, pickem.game_state)
                 continue
             pickem.game_state = game.game_state
@@ -279,6 +279,7 @@ class HockeyPickems(MixinMeta):
                 winner=None,
                 link=game.link,
                 game_type=game.game_type,
+                should_edit=await self.pickems_config.guild(guild).show_count(),
             )
 
             self.all_pickems[str(guild.id)][str(game.game_id)] = pickem
@@ -485,7 +486,7 @@ class HockeyPickems(MixinMeta):
 
     async def make_pickems_msg(self, guild: discord.Guild, game: Game) -> str:
         winner = ""
-        if game.game_state == "Final":
+        if game.game_state.value > GameState.over.value:
             team = game.home_team if game.home_score > game.away_score else game.away_team
             team_emoji = game.home_emoji if game.home_score > game.away_score else game.away_emoji
             winner = _("**WINNER:** {team_emoji} {team}").format(team_emoji=team_emoji, team=team)
@@ -540,7 +541,7 @@ class HockeyPickems(MixinMeta):
             else:
                 save_data[new_channel.guild.id].append(new_channel.id)
 
-        games_list = await Game.get_games(None, day, day, self.session)
+        games_list = await self.api.get_games(None, day, day)
 
         # msg_tasks = []
         for game in games_list:
@@ -640,7 +641,6 @@ class HockeyPickems(MixinMeta):
         tasks = []
         guild_data = []
         for days in range(7):
-
             guild_data.append(
                 await self.create_pickems_channels_and_message(
                     guilds, today + timedelta(days=days)
@@ -692,7 +692,7 @@ class HockeyPickems(MixinMeta):
                         # keep adding more of these to memory
                         # requiring us to reload over time
             except discord.errors.Forbidden:
-                log.error(f"Missing permissions to delete old pickems channel in {repr(guild)}")
+                log.error("Missing permissions to delete old pickems channel in %r", guild)
                 pass
             except Exception:
                 log.exception(f"Error deleting old pickems channels in {repr(guild)}")
@@ -711,7 +711,7 @@ class HockeyPickems(MixinMeta):
         async for name, pickems in AsyncIter(pickems_list.items(), steps=10):
             # check for definitive winner here just incase
             if name not in self.pickems_games:
-                game = await pickems.get_game()
+                game = await pickems.get_game(self.api)
                 self.pickems_games[name] = game
                 await self.set_guild_pickem_winner(self.pickems_games[name])
                 # Go through all the current pickems for every server
@@ -720,7 +720,7 @@ class HockeyPickems(MixinMeta):
                 # the main loop still get checked
             if not await pickems.check_winner(self.pickems_games[name]):
                 continue
-            log.debug("Tallying results for %s", repr(pickems))
+            log.debug("Tallying results for %r", pickems)
             to_remove.append(name)
             DEFAULT_LEADERBOARD = {
                 "season": 0,
@@ -747,12 +747,12 @@ class HockeyPickems(MixinMeta):
                             try:
                                 await bank.deposit_credits(member, int(base_credits))
                             except Exception:
-                                log.debug("Could not deposit pickems credits for %s", repr(member))
-                        if pickems.game_type == "P":
+                                log.debug("Could not deposit pickems credits for %r", member)
+                        if pickems.game_type is GameType.playoffs:
                             leaderboard[str(user)]["playoffs"] += 1
                             leaderboard[str(user)]["playoffs_weekly"] += 1
                             leaderboard[str(user)]["playoffs_total"] += 1
-                        elif pickems.game_type == "PR":
+                        elif pickems.game_type is GameType.pre_season:
                             leaderboard[str(user)]["pre-season"] += 1
                             leaderboard[str(user)]["pre-season_weekly"] += 1
                             leaderboard[str(user)]["pre-season_total"] += 1
@@ -763,9 +763,9 @@ class HockeyPickems(MixinMeta):
                             # playoffs is finished
                             leaderboard[str(user)]["weekly"] += 1
                     else:
-                        if pickems.game_type == "P":
+                        if pickems.game_type is GameType.playoffs:
                             leaderboard[str(user)]["playoffs_total"] += 1
-                        elif pickems.game_type == "PR":
+                        elif pickems.game_type is GameType.pre_season:
                             leaderboard[str(user)]["pre-season_total"] += 1
                         else:
                             leaderboard[str(user)]["total"] += 1
@@ -775,7 +775,7 @@ class HockeyPickems(MixinMeta):
                         # leaving this comment so I remember
         for name in to_remove:
             try:
-                log.debug(f"Removing pickem {name}")
+                log.verbose("Removing pickem %s", name)
                 del self.all_pickems[str(guild.id)][name]
                 async with self.pickems_config.guild(guild).pickems() as data:
                     if name in data:
@@ -1023,7 +1023,12 @@ class HockeyPickems(MixinMeta):
             await ctx.channel.send(page)
 
     async def check_pickems_req(self, ctx: commands.Context) -> bool:
-        msg = _("Pickems is not available at this time. Speak to the bot owner about enabling it.")
+        msg = await self.pickems_config.unavailable_msg()
+        if msg is None:
+            msg = _(
+                "Pickems is not available at this time. Speak to the bot owner about enabling it."
+            )
+
         if await self.pickems_config.only_allowed():
             if ctx.guild.id not in await self.pickems_config.allowed_guilds():
                 await ctx.send(msg)
@@ -1044,26 +1049,52 @@ class HockeyPickems(MixinMeta):
         If not provided this will use the current channel.
         """
         await ctx.defer()
-        if channel is None:
-            channel = ctx.channel
         if not await self.check_pickems_req(ctx):
             return
         if isinstance(channel, discord.Thread):
             msg = _("You cannot create threads within threads.")
             await ctx.send(msg)
             return
+        pickems_channel = ctx.channel
+        if channel is not None:
+            pickems_channel = channel
 
-        if not channel.permissions_for(ctx.guild.me).create_public_threads:
+        if not pickems_channel.permissions_for(ctx.guild.me).create_public_threads:
             msg = _("I don't have permission to create public threads!")
             await ctx.send(msg)
             return
+        if not pickems_channel.permissions_for(ctx.guild.me).manage_threads:
+            msg = _("I do not have permission to manage threads in {channel}.").format(
+                channel=pickems_channel.mention
+            )
+            await ctx.send(msg)
+            return
+        if not pickems_channel.permissions_for(ctx.guild.me).send_messages_in_threads:
+            msg = _("I do not have permission to send messages in threads in {channel}.").format(
+                channel=pickems_channel.mention
+            )
+            await ctx.send(msg)
+            return
 
-        await self.pickems_config.guild(ctx.guild).pickems_channel.set(channel.id)
+        await self.pickems_config.guild(ctx.guild).pickems_channel.set(pickems_channel.id)
         existing_channels = await self.pickems_config.guild(ctx.guild).pickems_channels()
         if existing_channels:
             await self.pickems_config.guild(ctx.guild).pickems_channels.clear()
         await self.create_weekly_pickems_pages([ctx.guild])
         msg = _("I will now automatically create pickems pages every day.")
+        await ctx.send(msg)
+
+    @pickems_commands.command(name="showcount")
+    @commands.is_owner()
+    async def set_pickems_edits(self, ctx: commands.Context, enabled: bool) -> None:
+        """
+        Enable pickems buttons to be edited showing the number of votes for each team
+        """
+        await self.pickems_config.guild(ctx.guild).show_count.set(enabled)
+        if enabled:
+            msg = _("Pickems will attempt to edit the buttons showing the number of votes.")
+        else:
+            msg = _("Pickems will not edit the buttons.")
         await ctx.send(msg)
 
     @pickems_commands.command(name="clear")
@@ -1091,17 +1122,18 @@ class HockeyPickems(MixinMeta):
         if not await self.check_pickems_req(ctx):
             return
         if date is None:
-            new_date = datetime.now()
+            new_date = datetime.now(timezone.utc)
         else:
             try:
                 new_date = datetime.strptime(date, "%Y-%m-%d")
+                new_date.replace(tzinfo=timezone.utc)
             except ValueError:
                 msg = _("`date` must be in the format `YYYY-MM-DD`.")
                 await ctx.send(msg)
                 return
         guild_message = await self.pickems_config.guild(ctx.guild).pickems_message()
         msg = _(PICKEMS_MESSAGE).format(guild_message=guild_message)
-        games_list = await Game.get_games(None, new_date, new_date, session=self.session)
+        games_list = await self.api.get_games(None, new_date, new_date)
         for page in pagify(msg):
             await ctx.channel.send(page)
         for game in games_list:

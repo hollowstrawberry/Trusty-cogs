@@ -1,6 +1,5 @@
 import asyncio
 import functools
-import logging
 import re
 from datetime import datetime
 from typing import Dict, List, Optional, Union
@@ -8,6 +7,7 @@ from typing import Dict, List, Optional, Union
 import aiohttp
 import discord
 import tweepy
+from red_commons.logging import getLogger
 from redbot.core import Config, commands
 from redbot.core.bot import Red
 from redbot.core.i18n import Translator
@@ -18,7 +18,7 @@ from .tweet_entry import TweetEntry
 
 _ = Translator("Tweets", __file__)
 
-log = logging.getLogger("red.trusty-cogs.Tweets")
+log = getLogger("red.trusty-cogs.Tweets")
 
 USER_FIELDS = [
     "created_at",
@@ -130,7 +130,7 @@ class TweetListener(AsyncStreamingClient):
 
     async def on_connection_error(self, error: Exception = None):
         if error is not None:
-            log.error(f"Error on Tweet stream connection attempt - {error}")
+            log.error("Error on Tweet stream connection attempt - %s", error)
 
     async def on_keep_alive(self):
         if "Keep-Alive" not in self.error_counts:
@@ -183,9 +183,9 @@ class TweetListener(AsyncStreamingClient):
                     error_title=error_title, error_details=error_details, link_info=error_type
                 )
                 if error_title == "operational-disconnect":
-                    log.info(error_msg)
+                    log.warning(error_msg)
                 else:
-                    log.error(error_msg)
+                    log.warning(error_msg)
                     full_msg += error_msg
                 if full_msg:
                     self.bot.dispatch("tweet_error", full_msg)
@@ -198,9 +198,9 @@ class TweetListener(AsyncStreamingClient):
                 error_title=error_title, error_details=error_details, link_info=error_type
             )
             if error_title == "operational-disconnect":
-                log.info(error_msg)
+                log.warning(error_msg)
             else:
-                log.error(error_msg)
+                log.warning(error_msg)
                 self.bot.dispatch("tweet_error", error_msg)
 
     async def on_closed(self, resp: aiohttp.ClientResponse):
@@ -219,7 +219,7 @@ class TweetListener(AsyncStreamingClient):
 
     async def on_disconnect(self) -> None:
         # self.last_disconnect = datetime.now().timestamp()
-        log.info(_("The Tweet stream has disconnected."))
+        log.info("The Tweet stream has disconnected.")
 
 
 class TweetsAPI:
@@ -231,7 +231,7 @@ class TweetsAPI:
     bot: Red
     accounts: Dict[str, TweetEntry]
     run_stream: bool
-    twitter_loop: Optional[tweepy.Stream]
+    twitter_loop: Optional[asyncio.Task]
     tweet_stream_view: discord.ui.View
     dashboard_authed: Dict[int, dict]
 
@@ -260,7 +260,7 @@ class TweetsAPI:
                     log.info("Tweets stream done or cancelled, restarting")
                     self.mystream.disconnect()
                     self.mystream.start()
-            log.debug(f"tweets waiting {base_sleep * count} seconds.")
+            log.debug("tweets waiting %s seconds.", base_sleep * count)
             await asyncio.sleep(base_sleep * count)
 
     async def refresh_token(self, user: discord.abc.User) -> dict:
@@ -318,7 +318,12 @@ class TweetsAPI:
             if user_tokens.get("expires_at", 0) <= datetime.now().timestamp():
                 return True
             else:
-                await self.refresh_token(user)
+                try:
+                    await self.refresh_token(user)
+                except Exception:
+                    log.exception("Users tokens could not be refreshed. Clearing.")
+                    await self.config.user(user).tokens.clear()
+                    return await self.authorize_user(ctx, interaction)
                 return True
         oauth_url = oauth.get_authorization_url()
         if interaction is not None or ctx and ctx.interaction:
@@ -391,9 +396,16 @@ class TweetsAPI:
         else:
             user_tokens = await self.config.user(user).tokens()
             if not user_tokens:
-                raise MissingTokenError()
+                raise MissingTokenError("")
             if datetime.now().timestamp() >= user_tokens.get("expires_at", 0):
-                user_tokens = await self.refresh_token(user)
+                try:
+                    user_tokens = await self.refresh_token(user)
+                except Exception:
+                    log.exception("Users tokens could not be refreshed.")
+                    await self.config.user(user).tokens.clear()
+                    raise MissingTokenError(
+                        "You will need to re-authorize to use these commands. Try again."
+                    )
             token_kwargs["bearer_token"] = user_tokens.get("access_token")
         # auth = tweepy.OAuthHandler(consumer, consumer_secret)
         # auth.set_access_token(access_token, access_secret)
@@ -526,7 +538,6 @@ class TweetsAPI:
 
     @commands.Cog.listener()
     async def on_tweet(self, response: tweepy.StreamResponse) -> None:
-        log.info(response)
         try:
             tweet = response.data
             user = await self.get_user(tweet.author_id, response.includes)
@@ -542,7 +553,7 @@ class TweetsAPI:
                 if channel is None:
                     continue
                 if nsfw and not channel.is_nsfw():
-                    log.info(f"Ignoring tweet from {user} because it is labeled as NSFW.")
+                    log.info("Ignoring tweet from %s because it is labeled as NSFW.", user)
                     continue
                 if str(user.id) in data.get("followed_accounts", {}):
                     tasks.append(
@@ -592,13 +603,21 @@ class TweetsAPI:
                         webhook = hook
                 if webhook is None:
                     webhook = await channel.create_webhook(name=channel.guild.me.name)
-                await webhook.send(
-                    content,
-                    username=user.username,
-                    avatar_url=user.profile_image_url,
-                    embeds=embeds,
-                    view=view,
-                )
+                if view is not None:
+                    await webhook.send(
+                        content,
+                        username=user.username,
+                        avatar_url=user.profile_image_url,
+                        embeds=embeds,
+                        view=view,
+                    )
+                else:
+                    await webhook.send(
+                        content,
+                        username=user.username,
+                        avatar_url=user.profile_image_url,
+                        embeds=embeds,
+                    )
             elif channel.permissions_for(channel.guild.me).embed_links:
                 await channel.send(content, embeds=embeds, view=view)
             else:

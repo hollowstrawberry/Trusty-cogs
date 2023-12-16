@@ -8,6 +8,7 @@ import discord
 from redbot.core import Config, commands
 from redbot.core.bot import Red
 
+from .api import HockeyAPI
 from .game import Game
 from .helper import (
     DateFinder,
@@ -22,7 +23,7 @@ from .pickems import Pickems
 from .stats import LeaderCategories
 
 
-class MixinMeta(ABC):
+class HockeyMixin(ABC):
     """
     Base class for well behaved type hint detection with composite class.
 
@@ -39,6 +40,7 @@ class MixinMeta(ABC):
         self.session: aiohttp.ClientSession
         self.pickems_config: Config
         self._ready: asyncio.Event
+        self.api: HockeyAPI
 
     #######################################################################
     # hockey_commands.py                                                  #
@@ -186,6 +188,10 @@ class MixinMeta(ABC):
 
     @abstractmethod
     async def otherdiscords(self, ctx: commands.Context, team: TeamFinder) -> None:
+        raise NotImplementedError()
+
+    @abstractmethod
+    async def get_image(self, file_name: str, url: str) -> discord.File:
         raise NotImplementedError()
 
     #######################################################################

@@ -1,9 +1,9 @@
 import asyncio
-import logging
 from abc import ABC
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 import discord
+from red_commons.logging import getLogger
 from redbot.core import Config, bank, commands
 from redbot.core.bot import Red
 from redbot.core.commands import Context
@@ -17,7 +17,7 @@ from .converter import RawUserIds, RoleHierarchyConverter, SelfRoleConverter
 from .events import RoleToolsEvents
 from .exclusive import RoleToolsExclusive
 from .inclusive import RoleToolsInclusive
-from .menus import BaseMenu, RolePages
+from .menus import BaseMenu, ConfirmView, RolePages
 from .messages import RoleToolsMessages
 from .reactions import RoleToolsReactions
 from .requires import RoleToolsRequires
@@ -26,7 +26,7 @@ from .settings import RoleToolsSettings
 
 roletools = RoleToolsMixin.roletools
 
-log = logging.getLogger("red.Trusty-cogs.RoleTools")
+log = getLogger("red.Trusty-cogs.RoleTools")
 _ = Translator("RoleTools", __file__)
 
 
@@ -37,6 +37,33 @@ class CompositeMetaClass(type(commands.Cog), type(ABC)):
     """
 
     pass
+
+
+def custom_cooldown(ctx: commands.Context) -> Optional[discord.app_commands.Cooldown]:
+    who = ctx.args[3:]
+    members = []
+
+    for entity in who:
+        log.verbose("custom_cooldown entity: %s", entity)
+        if isinstance(entity, discord.TextChannel) or isinstance(entity, discord.Role):
+            members += entity.members
+        elif isinstance(entity, discord.Member):
+            members.append(entity)
+        else:
+            if entity not in ["everyone", "here", "bots", "humans"]:
+                continue
+            elif entity == "everyone":
+                members = ctx.guild.members
+                break
+            elif entity == "here":
+                members += [m for m in ctx.guild.members if str(m.status) == "online"]
+            elif entity == "bots":
+                members += [m for m in ctx.guild.members if m.bot]
+            elif entity == "humans":
+                members += [m for m in ctx.guild.members if not m.bot]
+    members = list(set(members))
+    log.debug("Returning cooldown of 1 per %s", min(len(members) * 10, 3600))
+    return discord.app_commands.Cooldown(1, min(len(members) * 10, 3600))
 
 
 @cog_i18n(_)
@@ -58,7 +85,7 @@ class RoleTools(
     """
 
     __author__ = ["TrustyJAID"]
-    __version__ = "1.5.0"
+    __version__ = "1.5.11"
 
     def __init__(self, bot: Red):
         self.bot = bot
@@ -93,7 +120,9 @@ class RoleTools(
         self.config.register_member(sticky_roles=[])
         self.settings: Dict[int, Any] = {}
         self._ready: asyncio.Event = asyncio.Event()
-        self.views = []
+        self.views: Dict[int, Dict[str, discord.ui.View]] = {}
+        self._repo = ""
+        self._commit = ""
 
     def cog_check(self, ctx: commands.Context) -> bool:
         return self._ready.is_set()
@@ -103,7 +132,53 @@ class RoleTools(
         Thanks Sinbad!
         """
         pre_processed = super().format_help_for_context(ctx)
-        return f"{pre_processed}\n\nCog Version: {self.__version__}"
+        ret = f"{pre_processed}\n\n- Cog Version: {self.__version__}\n"
+        # we'll only have a repo if the cog was installed through Downloader at some point
+        if self._repo:
+            ret += f"- Repo: {self._repo}\n"
+        # we should have a commit if we have the repo but just incase
+        if self._commit:
+            ret += f"- Commit: [{self._commit[:9]}]({self._repo}/tree/{self._commit})"
+        return ret
+
+    async def add_cog_to_dev_env(self):
+        await self.bot.wait_until_red_ready()
+        if self.bot.owner_ids and 218773382617890828 in self.bot.owner_ids:
+            try:
+                self.bot.add_dev_env_value("roletools", lambda x: self)
+            except Exception:
+                pass
+
+    async def _get_commit(self):
+        downloader = self.bot.get_cog("Downloader")
+        if not downloader:
+            return
+        cogs = await downloader.installed_cogs()
+        for cog in cogs:
+            if cog.name == "roletools":
+                if cog.repo is not None:
+                    self._repo = cog.repo.clean_url
+                self._commit = cog.commit
+
+    async def load_views(self):
+        self.settings = await self.config.all_guilds()
+        await self.bot.wait_until_red_ready()
+        try:
+            await self.initialize_select()
+        except Exception:
+            log.exception("Error initializing Select")
+        try:
+            await self.initialize_buttons()
+        except Exception:
+            log.exception("Error initializing Buttons")
+        for guild_id, guild_views in self.views.items():
+            for msg_ids, view in guild_views.items():
+                log.trace("Adding view %r to %s", view, guild_id)
+                channel_id, message_id = msg_ids.split("-")
+                self.bot.add_view(view, message_id=int(message_id))
+                # These should be unique messages containing views
+                # and we should track them seperately
+        self._ready.set()
 
     async def cog_load(self) -> None:
         if await self.config.version() < "1.0.1":
@@ -141,55 +216,54 @@ class RoleTools(
                             if role.id not in auto_roles:
                                 auto_roles.append(role.id)
             await self.config.version.set("1.0.1")
-
-        self.settings = await self.config.all_guilds()
-        try:
-            await self.initialize_buttons()
-        except Exception:
-            log.exception("Error initializing Buttons")
-
-        try:
-            await self.initialize_select()
-        except Exception:
-            log.exception("Error initializing Select")
-        self._ready.set()
+        loop = asyncio.get_running_loop()
+        loop.create_task(self.load_views())
+        loop.create_task(self.add_cog_to_dev_env())
+        loop.create_task(self._get_commit())
 
     async def cog_unload(self):
-        for view in self.views:
-            # Don't forget to remove persistent views when the cog is unloaded.
-            log.debug(f"Stopping view {view}")
-            view.stop()
+        for views in self.views.values():
+            for view in views.values():
+                # Don't forget to remove persistent views when the cog is unloaded.
+                log.verbose("Stopping view %s", view)
+                view.stop()
+        try:
+            self.bot.remove_dev_env_value("roletools")
+        except Exception:
+            pass
 
-    def update_cooldown(
-        self, ctx: commands.Context, rate: int, per: float, _type: commands.BucketType
+    async def confirm_selfassignable(
+        self, ctx: commands.Context, roles: List[discord.Role]
     ) -> None:
-        """
-        This should be replaced if d.py ever adds the ability to do this
-        without hacking the cooldown system as I have here.
-
-        This calls the same method as `commands.reset_cooldown(ctx)`
-        but rather than resetting the cooldown value we want to dynamically change
-        what the cooldown actually is.
-
-        In this cog I only care to change the per value but theoretically
-        this will for other modifications to the cooldown after we have parsed
-        the command.
-
-        This, in my case, is being used to dynamically adjust the cooldown rate
-        so that bots aren't spamming the API with add/remove role requests for large
-        guilds. It doesn't make sense to constantly have a 1 hour cooldown until you've
-        run this on a rather large server for everyone in the server.
-
-        Technically speaking cooldown is added as 10 seconds per member who has had their role
-        modified with these commands up to a maximum of 1 hour. This means small guilds trying
-        to give everyone a role can do it semi-frequently but large guilds can only run
-        it once for everyone in the server every hour.
-        """
-        if ctx.command._buckets.valid:
-            bucket = ctx.command._buckets.get_bucket(ctx.message)
-            bucket.rate = int(rate)
-            bucket.per = float(per)
-            bucket.type = _type
+        not_assignable = [r for r in roles if not await self.config.role(r).selfassignable()]
+        if not_assignable:
+            role_list = "\n".join(f"- {role.mention}" for role in not_assignable)
+            msg_str = _(
+                "The following roles are not self assignable:\n{roles}\n"
+                "Would you liked to make them self assignable and self removeable?"
+            ).format(
+                roles=role_list,
+            )
+            pred = ConfirmView(ctx.author)
+            pred.message = await ctx.send(
+                msg_str, view=pred, allowed_mentions=discord.AllowedMentions(roles=False)
+            )
+            await pred.wait()
+            if pred.result:
+                for role in not_assignable:
+                    await self.config.role(role).selfassignable.set(True)
+                    await self.config.role(role).selfremovable.set(True)
+                await ctx.channel.send(
+                    _(
+                        "The following roles have been made self assignable and self removeable:\n{roles}"
+                    ).format(roles=role_list)
+                )
+            else:
+                await ctx.channel.send(
+                    _("Okay I won't make the following rolesself assignable:\n{roles}").format(
+                        roles=role_list
+                    )
+                )
 
     @roletools.group(invoke_without_command=True)
     @commands.bot_has_permissions(manage_roles=True)
@@ -265,7 +339,7 @@ class RoleTools(
     @commands.bot_has_permissions(manage_roles=True)
     @commands.admin_or_permissions(manage_roles=True)
     @commands.max_concurrency(1, commands.BucketType.guild)
-    @commands.cooldown(1, 10, commands.BucketType.guild)
+    @commands.dynamic_cooldown(custom_cooldown, commands.BucketType.guild)
     async def giverole(
         self,
         ctx: Context,
@@ -311,11 +385,8 @@ class RoleTools(
                 else:
                     if entity not in ["everyone", "here", "bots", "humans"]:
                         msg = _("`{who}` cannot have roles assigned to them.").format(who=entity)
-                        if is_slash:
-                            await ctx.followup.send(msg)
-                        else:
-                            await ctx.send(msg)
-                            ctx.command.reset_cooldown(ctx)
+                        await ctx.send(msg)
+                        ctx.command.reset_cooldown(ctx)
                         return
                     elif entity == "everyone":
                         members = ctx.guild.members
@@ -346,7 +417,6 @@ class RoleTools(
                     )
                 )
             await bounded_gather(*tasks)
-        self.update_cooldown(ctx, 1, min(len(tasks) * 10, 3600), commands.BucketType.guild)
         added_to = humanize_list([getattr(en, "name", en) for en in who])
         msg = _("Added {role} to {added}.").format(role=role.mention, added=added_to)
         await ctx.send(msg)
@@ -355,7 +425,7 @@ class RoleTools(
     @commands.bot_has_permissions(manage_roles=True)
     @commands.admin_or_permissions(manage_roles=True)
     @commands.max_concurrency(1, commands.BucketType.guild)
-    @commands.cooldown(1, 10, commands.BucketType.guild)
+    @commands.dynamic_cooldown(custom_cooldown, commands.BucketType.guild)
     async def removerole(
         self,
         ctx: Context,
@@ -429,7 +499,6 @@ class RoleTools(
                     self.remove_roles(m, [role], _("Roletools Removerole command"), atomic=False)
                 )
             await bounded_gather(*tasks)
-        self.update_cooldown(ctx, 1, min(len(tasks) * 10, 3600), commands.BucketType.guild)
         removed_from = humanize_list([getattr(en, "name", en) for en in who])
         msg = _("Removed the {role} from {removed}.").format(
             role=role.mention, removed=removed_from

@@ -1,14 +1,16 @@
-import logging
 from typing import Any, List, NamedTuple, Optional, Union
 
 import discord
 import mendeleev
+from red_commons.logging import getLogger
 from redbot.core import commands
 from redbot.vendored.discord.ext import menus
 
 from .data import IMAGES, LATTICES, UNITS
 
-log = logging.getLogger("red.trusty-cogs.elements")
+log = getLogger("red.trusty-cogs.elements")
+
+ELEMENTS = mendeleev.get_all_elements()
 
 
 class ElementConverter(discord.app_commands.Transformer):
@@ -44,7 +46,7 @@ class ElementConverter(discord.app_commands.Transformer):
             discord.app_commands.Choice(
                 name=f"{element.atomic_number} - {element.name}", value=str(element.atomic_number)
             )
-            for element in mendeleev.get_all_elements()
+            for element in ELEMENTS
         ]
         choices = [i for i in all_choices if current.lower() in i.name.lower()]
         return choices[:25]
@@ -61,7 +63,7 @@ class MeasurementConverter(discord.app_commands.Transformer):
 
     @classmethod
     async def convert(cls, ctx: commands.Context, argument: str) -> Optional[Measurements]:
-        log.debug("this converter is being hit")
+        log.trace("MeasurementConverter is being hit")
         result = None
         if argument.lower() in UNITS:
             value = argument.lower()
@@ -103,25 +105,25 @@ class MeasurementConverter(discord.app_commands.Transformer):
 def get_xray_wavelength(element: mendeleev.models.Element) -> str:
     try:
         ka = 1239.84 / (
-            13.6057 * ((element.atomic_number - 1) ** 2) * ((1 / 1 ** 2) - (1 / 2 ** 2))
+            13.6057 * ((element.atomic_number - 1) ** 2) * ((1 / 1**2) - (1 / 2**2))
         )
     except Exception:
         ka = ""
     try:
         kb = 1239.84 / (
-            13.6057 * ((element.atomic_number - 1) ** 2) * ((1 / 1 ** 2) - (1 / 3 ** 2))
+            13.6057 * ((element.atomic_number - 1) ** 2) * ((1 / 1**2) - (1 / 3**2))
         )
     except Exception:
         kb = ""
     try:
         la = 1239.84 / (
-            13.6057 * ((element.atomic_number - 7.4) ** 2) * ((1 / 1 ** 2) - (1 / 2 ** 3))
+            13.6057 * ((element.atomic_number - 7.4) ** 2) * ((1 / 1**2) - (1 / 2**3))
         )
     except Exception:
         la = ""
     try:
         lb = 1239.84 / (
-            13.6057 * ((element.atomic_number - 7.4) ** 2) * ((1 / 1 ** 2) - (1 / 2 ** 4))
+            13.6057 * ((element.atomic_number - 7.4) ** 2) * ((1 / 1**2) - (1 / 2**4))
         )
     except Exception:
         lb = ""
@@ -377,7 +379,7 @@ class BaseView(discord.ui.View):
 class Elements(commands.Cog):
     """Display information from the periodic table of elements"""
 
-    __version__ = "1.1.0"
+    __version__ = "1.1.1"
     __author__ = "TrustyJAID"
 
     def __init__(self, bot):
@@ -415,13 +417,14 @@ class Elements(commands.Cog):
         `measurement` can be any of the Elements data listed here
         https://mendeleev.readthedocs.io/en/stable/data.html#electronegativities
         """
-        if measurement is None or element is None:
-            elements = mendeleev.get_all_elements()
-            page_start = 0
-            if element is not None:
-                page_start = element.atomic_number - 1
 
-            source = ElementPages(elements)
+        if measurement is None or element is None:
+            async with ctx.typing():
+                page_start = 0
+                if element is not None:
+                    page_start = element.atomic_number - 1
+
+                source = ElementPages(ELEMENTS)
             await BaseView(
                 source=source,
                 cog=self,
@@ -429,15 +432,16 @@ class Elements(commands.Cog):
             ).start(ctx)
             return
         else:
-            extra_1 = ""
-            extra_2 = ""
-            name = measurement.name
-            units = measurement.units
-            data = getattr(element, measurement.key, "")
-            if measurement.key == "lattice_structure":
-                extra_1, extra_2 = LATTICES[element.lattice_structure]
-            if measurement.key == "xrf":
-                extra_2 = get_xray_wavelength(element)
+            async with ctx.typing():
+                extra_1 = ""
+                extra_2 = ""
+                name = measurement.name
+                units = measurement.units
+                data = getattr(element, measurement.key, "")
+                if measurement.key == "lattice_structure":
+                    extra_1, extra_2 = LATTICES[element.lattice_structure]
+                if measurement.key == "xrf":
+                    extra_2 = get_xray_wavelength(element)
 
-            msg = f" {element.name}:{name} {data} {extra_1} {extra_2} {units}\n"
+                msg = f" {element.name}:{name} {data} {extra_1} {extra_2} {units}\n"
             await ctx.send(msg)

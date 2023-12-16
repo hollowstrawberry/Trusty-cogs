@@ -1,9 +1,9 @@
 import asyncio
-import logging
 from typing import Literal, Optional
 
 import discord
 import tweepy
+from red_commons.logging import getLogger
 from redbot.core import Config, checks, commands
 from redbot.core.i18n import Translator, cog_i18n
 from redbot.core.utils.chat_formatting import humanize_number
@@ -14,7 +14,7 @@ from .tweets_api import USER_FIELDS, TweetsAPI
 
 _ = Translator("Tweets", __file__)
 
-log = logging.getLogger("red.trusty-cogs.Tweets")
+log = getLogger("red.trusty-cogs.Tweets")
 
 
 @cog_i18n(_)
@@ -24,7 +24,7 @@ class Tweets(TweetsAPI, commands.Cog):
     """
 
     __author__ = ["Palm__", "TrustyJAID"]
-    __version__ = "3.0.0"
+    __version__ = "3.0.1"
 
     def __init__(self, bot):
         self.bot = bot
@@ -133,76 +133,8 @@ class Tweets(TweetsAPI, commands.Cog):
             return
         await ctx.send(_("Tweet sent!"))
 
-    @_tweets.command(name="trends")
-    async def trends(self, ctx: commands.Context, *, location: str = "United States") -> None:
-        """
-        Gets twitter trends for a given location
-
-        You can provide a location and it will try to get
-        different trend information from that location
-        default is `United States`
-        """
-        try:
-            api = await self.authenticate()
-        except MissingTokenError as e:
-            await e.send_error(ctx)
-            return
-        try:
-            fake_task = functools.partial(api.available_trends)
-            task = self.bot.loop.run_in_executor(None, fake_task)
-            location_list = await asyncio.wait_for(task, timeout=10)
-        except asyncio.TimeoutError:
-            await ctx.send(_("Timed out getting twitter trends."))
-            return
-        country_id = None
-        location_names = []
-        for locations in location_list:
-            location_names.append(locations["name"])
-            if location.lower() in locations["name"].lower():
-                country_id = locations
-        if country_id is None:
-            await ctx.send("{} Is not a correct location!".format(location))
-            return
-        try:
-            fake_task = functools.partial(api.get_place_trends, country_id["woeid"])
-            task = self.bot.loop.run_in_executor(None, fake_task)
-            trends = await asyncio.wait_for(task, timeout=10)
-        except asyncio.TimeoutError:
-            await ctx.send(_("Timed out getting twitter trends."))
-            return
-        em = discord.Embed(
-            colour=await self.bot.get_embed_colour(ctx.channel),
-            title=country_id["name"],
-        )
-        msg = ""
-        trends = trends[0]["trends"]
-        for trend in trends:
-            # trend = trends[0]["trends"][i]
-            if trend["tweet_volume"] is not None:
-                msg += "{}. [{}]({}) Volume: {}\n".format(
-                    trends.index(trend) + 1,
-                    trend["name"],
-                    trend["url"],
-                    trend["tweet_volume"],
-                )
-            else:
-                msg += "{}. [{}]({})\n".format(
-                    trends.index(trend) + 1, trend["name"], trend["url"]
-                )
-        count = 0
-        for page in pagify(msg[:5980], shorten_by=1024):
-            if count == 0:
-                em.description = page
-            else:
-                em.add_field(name=_("Trends (continued)"), value=page)
-            count += 1
-        em.timestamp = datetime.utcnow()
-        if ctx.channel.permissions_for(ctx.me).embed_links:
-            await ctx.send(embed=em)
-        else:
-            await ctx.send("```\n{}```".format(msg[:1990]))
-
     async def get_twitter_user(self, username: str) -> tweepy.User:
+        username = username.replace("@", "")
         try:
             api = await self.authenticate()
             user = await api.get_user(
@@ -265,6 +197,9 @@ class Tweets(TweetsAPI, commands.Cog):
         """
         Display a users tweets as a scrollable message
         """
+        if username and "@" in username:
+            await ctx.send(_("Don't include the @ symbol in the username."))
+            return
         async with ctx.typing():
             if not await self.authorize_user(ctx):
                 return
@@ -285,6 +220,9 @@ class Tweets(TweetsAPI, commands.Cog):
         Note: This may not work if the username is not present in one of the stream rules.
         You can view existing rules with `[p]tweets stream rules`
         """
+        if "@" in username:
+            await ctx.send(_("Don't include the @ symbol in the username."))
+            return
         resp = await self.get_twitter_user(username)
         if not resp.data:
             await ctx.send(
@@ -356,128 +294,6 @@ class Tweets(TweetsAPI, commands.Cog):
                 )
             )
         else:
-            msg = _("I am already posting {username} in {channel}.").format(
-                username=username, channel=channel.mention
-            )
-            await ctx.send(msg)
-
-    @_autotweet.command(name="list")
-    @commands.bot_has_permissions(embed_links=True)
-    async def _list(self, ctx: commands.context) -> None:
-        """Lists the autotweet accounts on the guild"""
-        guild = ctx.message.guild
-        async with ctx.typing():
-            account_list = {}
-            async for user_id, account in AsyncIter(self.accounts.items(), steps=50):
-                for channel_id, channel_data in account.channels.items():
-                    if chan := guild.get_channel(int(channel_id)):
-                        chan_info = f"{account.twitter_name} - {channel_data}\n"
-                        if chan not in account_list:
-                            account_list[chan] = [chan_info]
-                        else:
-                            account_list[chan].append(chan_info)
-            account_str = ""
-            for chan, accounts in account_list.items():
-                account_str += f"{chan.mention} - {humanize_list(accounts)}"
-            embed_list = []
-            for page in pagify(account_str):
-                embed = discord.Embed(
-                    title="Twitter accounts posting in {}".format(guild.name),
-                    colour=await self.bot.get_embed_colour(ctx.channel),
-                    description=page,
-                )
-                embed.set_author(name=guild.name, icon_url=guild.icon_url)
-                embed_list.append(embed)
-        if not embed_list:
-            await ctx.send(_("There are no Twitter accounts posting in this server."))
-            return
-        await BaseMenu(source=TweetListPages(embed_list)).start(ctx=ctx)
-
-    async def save_accounts(self) -> None:
-        data = {str(k): v.to_json() for k, v in self.accounts.items()}
-        await self.config.accounts.set(data)
-
-    async def add_account(
-        self, channel: discord.TextChannel, user_id: int, screen_name: str
-    ) -> bool:
-        """
-        Adds a twitter account to the specified channel.
-        Returns False if it is already in the channel.
-        """
-
-        if str(user_id) in self.accounts:
-            if str(channel.id) in self.accounts[str(user_id)].channels:
-                return False
-            else:
-                self.accounts[str(user_id)].channels[str(channel.id)] = ChannelData(
-                    guild=channel.guild.id,
-                    replies=False,
-                    retweets=True,
-                    embeds=True,
-                )
-                await self.save_accounts()
-        else:
-            channels = {str(channel.id): ChannelData(guild=channel.guild.id)}
-            twitter_account = TweetEntry(
-                twitter_id=user_id,
-                twitter_name=screen_name,
-                channels=channels,
-                last_tweet=0,
-            )
-            self.accounts[str(user_id)] = twitter_account
-            await self.save_accounts()
-        return True
-
-    def get_tweet_list(self, api: tweepy.API, owner: str, list_name: str) -> List[int]:
-        cursor = -1
-        list_members: list = []
-        for member in tweepy.Cursor(
-            api.get_list_members, owner_screen_name=owner, slug=list_name, cursor=cursor
-        ).items():
-            list_members.append(member)
-        return list_members
-
-    @_autotweet.command(name="addlist")
-    async def add_list(
-        self,
-        ctx: commands.context,
-        owner: str,
-        list_name: str,
-        channel: Optional[discord.TextChannel] = None,
-    ) -> None:
-        """
-        Add an entire twitter list to a specified channel.
-
-        The list must be public or the bot owner must own it.
-        `owner` is the owner of the list's @handle
-        `list_name` is the name of the list
-        `channel` is the channel where the tweets will be posted
-        """
-        try:
-            api = await self.authenticate()
-        except MissingTokenError as e:
-            await e.send_error(ctx)
-            return
-        try:
-            fake_task = functools.partial(
-                self.get_tweet_list, api=api, owner=owner, list_name=list_name
-            )
-            task = ctx.bot.loop.run_in_executor(None, fake_task)
-            list_members = await asyncio.wait_for(task, timeout=30)
-        except asyncio.TimeoutError:
-            msg = _("Adding that tweet list took too long.")
-            log.error(msg, exc_info=True)
-            await ctx.send(msg)
-            return
-        except Exception:
-            log.error("Error adding list", exc_info=True)
-            msg = _("That `owner` and `list_name` " "don't appear to be available")
-            await ctx.send(msg)
-            return
-        if channel is None:
-            channel = ctx.channel
-        own_perms = channel.permissions_for(ctx.me)
-        if not own_perms.send_messages:
             await ctx.send(
                 _("Like, retweet, and reply buttons enabled in {channel}.").format(
                     channel=channel.mention
@@ -495,6 +311,9 @@ class Tweets(TweetsAPI, commands.Cog):
         Note: This may not work if the username is not present in one of the stream rules.
         You can view existing rules with `[p]tweets stream rules`
         """
+        if "@" in username:
+            await ctx.send(_("Don't include the @ symbol in the username."))
+            return
         resp = await self.get_twitter_user(username)
         if not resp.data:
             await ctx.send(
@@ -596,73 +415,7 @@ class Tweets(TweetsAPI, commands.Cog):
                     response += error_msg
         await ctx.send(response)
 
-    @_autotweet.command(name="del", aliases=["delete", "rem", "remove"])
-    async def _del(
-        self,
-        ctx: commands.Context,
-        channel: discord.TextChannel,
-        username: Optional[str],
-    ) -> None:
-        """
-        Removes a twitter username to the specified channel
-
-        `<channel>` The channel in which you want to remove twitter posts for.
-        `[username]` Optional @handle name for the user you want to remove.
-        If `username` is not provided all users posting in the provided channel
-        will be removed.
-        """
-        try:
-            api = await self.authenticate()
-        except MissingTokenError as e:
-            await e.send_error(ctx)
-            return
-        user_id: Optional[int] = None
-        screen_name: Optional[str] = None
-        if username:
-            try:
-                for status in tweepy.Cursor(api.user_timeline, id=username).items(1):
-                    user_id = status.user.id
-                    screen_name = status.user.screen_name
-            except tweepy.errors.TweepyException as e:
-                msg = (
-                    _("Whoops! Something went wrong here. The error code is ") + f"{e} {username}"
-                )
-                log.error(msg, exc_info=True)
-                await ctx.send(_("Something went wrong here! Try again"))
-                return
-        removed = await self.del_account(channel.id, user_id, screen_name)
-        if removed:
-            accounts = humanize_list([i for i in removed.values()])
-            msg = _("The following users have been removed from {channel}:\n{accounts}").format(
-                channel=channel.mention, accounts=accounts
-            )
-            await ctx.send(msg)
-        else:
-            await ctx.send(
-                _("{username} doesn't seem to be posting in {channel}").format(
-                    username=username, channel=channel.mention
-                )
-            )
-
-    @commands.group(name="tweetset")
-    @checks.admin_or_permissions(manage_guild=True)
-    async def _tweetset(self, ctx: commands.Context) -> None:
-        """Command for setting required access information for the API.
-
-        1. Visit https://apps.twitter.com and apply for a developer account.
-        2. Once your account is approved Create a standalone app and copy the
-        **API Key and API Secret**.
-        3. On the standalone apps page select regenerate **Access Token and Secret**
-        and copy those somewhere safe.
-        4. Do `[p]set api twitter
-        consumer_key YOUR_CONSUMER_KEY
-        consumer_secret YOUR_CONSUMER_SECRET
-        access_token YOUR_ACCESS_TOKEN
-        access_secret YOUR_ACCESS_SECRET`
-        """
-        pass
-
-    @_tweetset.command(name="creds")
+    @_tweets.command(name="creds")
     @checks.is_owner()
     async def set_creds(
         self,
@@ -673,7 +426,7 @@ class Tweets(TweetsAPI, commands.Cog):
             "1. Visit https://apps.twitter.com and apply for a developer account.\n"
             "2. Once your account is approved Create a Project\n"
             "3. Add an app to the project and copy the **Bearer Token** "
-            "(Optionally) Copy the **Client ID** and **Client Secret**"
+            "(Optionally) Copy the **Client ID** and **Client Secret**\n"
             "4. Under User authentication settings enable OAuth 2.0, customize the settings "
             "however you want the bot to work, and remember or set the redirect uri.\n\n"
             "5. Do `[p]set api twitter "
@@ -691,7 +444,9 @@ class Tweets(TweetsAPI, commands.Cog):
         view = SetApiView("twitter", keys)
         if await ctx.embed_requested():
             em = discord.Embed(description=msg)
-            await ctx.send(embed=em, view=view)
+            message = await ctx.send(embed=em, view=view)
             # await ctx.send(embed=em)
         else:
-            await ctx.send(msg, view=view)
+            message = await ctx.send(msg, view=view)
+        await view.wait()
+        await message.edit(view=None)

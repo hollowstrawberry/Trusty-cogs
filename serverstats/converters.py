@@ -1,4 +1,3 @@
-import logging
 import re
 from typing import List, Union
 
@@ -6,12 +5,13 @@ import discord
 from discord.ext.commands.converter import IDConverter
 from discord.ext.commands.errors import BadArgument
 from rapidfuzz import process
+from red_commons.logging import getLogger
 from redbot.core import commands
 from redbot.core.i18n import Translator
 from unidecode import unidecode
 
 _ = Translator("ServerStats", __file__)
-log = logging.getLogger("red.trusty-cogs.ServerStats")
+log = getLogger("red.trusty-cogs.ServerStats")
 
 
 class GuildConverter(discord.app_commands.Transformer):
@@ -141,36 +141,19 @@ class PermissionConverter(IDConverter):
     """
 
     async def convert(self, ctx: commands.Context, argument: str) -> str:
-        valid_perms = [
-            "add_reactions",
-            "attach_files",
-            "connect",
-            "create_instant_invite",
-            "deafen_members",
-            "embed_links",
-            "external_emojis",
-            "manage_messages",
-            "manage_permissions",
-            "manage_roles",
-            "manage_webhooks",
-            "move_members",
-            "mute_members",
-            "priority_speaker",
-            "read_message_history",
-            "read_messages",
-            "send_messages",
-            "send_tts_messages",
-            "speak",
-            "stream",
-            "use_external_emojis",
-            "use_slash_commands",
-            "use_voice_activation",
-            "view_channel",
-        ]
-        match = re.match(r"|".join(i for i in valid_perms), argument, flags=re.I)
-
+        valid_perms = dict(discord.Permissions.all_channel())
+        error_string = "\n".join(f"- {i}" for i, v in valid_perms.items() if v)
+        match = re.match(
+            r"|".join(i for i, allowed in valid_perms.items() if allowed), argument, flags=re.I
+        )
+        if not match:
+            raise BadArgument(
+                f"Permission `{argument}` not found. Please pick from:\n{error_string}"
+            )
         result = match.group(0)
 
         if not result:
-            raise BadArgument(f"Permission `{argument}` not found")
+            raise BadArgument(
+                f"Permission `{argument}` not found. Please pick from:\n{error_string}"
+            )
         return result

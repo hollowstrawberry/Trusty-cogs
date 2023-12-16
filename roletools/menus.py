@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-import logging
 from typing import Any, List, Optional
 
 import discord
+from red_commons.logging import getLogger
 
 # from discord.ext.commands.errors import BadArgument
 from redbot.core import bank
@@ -12,7 +12,7 @@ from redbot.core.i18n import Translator
 from redbot.core.utils.chat_formatting import humanize_list, pagify
 from redbot.vendored.discord.ext import menus
 
-log = logging.getLogger("red.Trusty-cogs.RoleTools")
+log = getLogger("red.Trusty-cogs.RoleTools")
 _ = Translator("RoleTools", __file__)
 
 
@@ -197,10 +197,67 @@ class SelectMenuPages(menus.ListPageSource):
 class RoleToolsSelectOption(discord.ui.RoleSelect):
     def __init__(self, placeholder: str = _("Select a role")):
         super().__init__(min_values=1, max_values=1, placeholder=placeholder)
+        self.current_role: discord.Role
 
     async def callback(self, interaction: discord.Interaction):
         index = interaction.guild.roles.index(self.values[0])
         await self.view.show_checked_page(index, interaction)
+
+
+class StickyToggleButton(discord.ui.Button):
+    def __init__(
+        self,
+    ):
+        super().__init__(style=discord.ButtonStyle.green, label=_("Sticky"))
+        self.view: BaseMenu
+
+    async def callback(self, interaction: discord.Interaction):
+        cog = interaction.client.get_cog("RoleTools")
+        current = await cog.config.role(self.view._source.current_role).sticky()
+        await cog.config.role(self.view._source.current_role).sticky.set(not current)
+        await self.view.show_page(self.view.current_page, interaction)
+
+
+class AutoToggleButton(discord.ui.Button):
+    def __init__(
+        self,
+    ):
+        super().__init__(style=discord.ButtonStyle.green, label=_("Auto"))
+        self.view: BaseMenu
+
+    async def callback(self, interaction: discord.Interaction):
+        cog = interaction.client.get_cog("RoleTools")
+        current = await cog.config.role(self.view._source.current_role).auto()
+        await cog.config.role(self.view._source.current_role).auto.set(not current)
+        await self.view.show_page(self.view.current_page, interaction)
+
+
+class SelfAddToggleButton(discord.ui.Button):
+    def __init__(
+        self,
+    ):
+        super().__init__(style=discord.ButtonStyle.green, label=_("Selfassignable"))
+        self.view: BaseMenu
+
+    async def callback(self, interaction: discord.Interaction):
+        cog = interaction.client.get_cog("RoleTools")
+        current = await cog.config.role(self.view._source.current_role).selfassignable()
+        await cog.config.role(self.view._source.current_role).selfassignable.set(not current)
+        await self.view.show_page(self.view.current_page, interaction)
+
+
+class SelfRemToggleButton(discord.ui.Button):
+    def __init__(
+        self,
+    ):
+        super().__init__(style=discord.ButtonStyle.green, label=_("Selfremovable"))
+        self.view: BaseMenu
+
+    async def callback(self, interaction: discord.Interaction):
+        cog = interaction.client.get_cog("RoleTools")
+        current = await cog.config.role(self.view._source.current_role).selfremovable()
+        await cog.config.role(self.view._source.current_role).selfremovable.set(not current)
+        await self.view.show_page(self.view.current_page, interaction)
 
 
 class RolePages(menus.ListPageSource):
@@ -210,8 +267,10 @@ class RolePages(menus.ListPageSource):
     def is_paginating(self):
         return True
 
-    async def format_page(self, menu: menus.MenuPages, role: discord.Role):
+    async def format_page(self, menu: BaseMenu, role: discord.Role):
+        self.current_role = role
         role_settings = await menu.cog.config.role(role).all()
+        menu.update_buttons(role_settings)
         msg = _("Role Settings for {role}\n".format(role=role.name))
         jump_url = "https://discord.com/channels/{guild}/{channel}/{message}"
         em = discord.Embed(title=msg, colour=role.colour)
@@ -224,11 +283,17 @@ class RolePages(menus.ListPageSource):
             [perm.replace("_", " ").title() for perm, value in role.permissions if value]
         )
         buttons = humanize_list(role_settings["buttons"])
+        select_options = humanize_list(role_settings["select_options"])
         require_any = role_settings["require_any"]
         settings = _(
             "{role}\n```md\n"
             "# ID:           {role_id}\n"
             "Colour          {colour}\n"
+            "Members         {members}\n"
+            "Assignable      {assignable}\n"
+            "Mentionable     {mentionable}\n"
+            "Position        {position}\n"
+            "Hoisted         {hoisted}\n"
             "# RoleTools settings\n"
             "Sticky          {sticky}\n"
             "Auto            {auto}\n"
@@ -241,6 +306,11 @@ class RolePages(menus.ListPageSource):
         ).format(
             role=role.mention,
             role_id=role.id,
+            members=len(role.members),
+            assignable=role.is_assignable(),
+            mentionable=role.mentionable,
+            position=role.position,
+            hoisted=role.hoist,
             sticky=role_settings["sticky"],
             auto=role_settings["auto"],
             selfassign=role_settings["selfassignable"],
@@ -249,6 +319,9 @@ class RolePages(menus.ListPageSource):
             mod=role in mod_roles,
             admin=role in admin_roles,
         )
+        settings += _("**Created:** {created_at}\n").format(
+            created_at=discord.utils.format_dt(role.created_at)
+        )
         if cost := role_settings.get("cost"):
             currency_name = await bank.get_currency_name(menu.ctx.guild)
             settings += _("**Cost:** {cost} {currency_name}\n").format(
@@ -256,6 +329,10 @@ class RolePages(menus.ListPageSource):
             )
         if buttons:
             settings += _("**Buttons:** {button_names}\n").format(button_names=buttons)
+        if select_options:
+            settings += _("**Select Options:** {select_names}\n").format(
+                select_names=select_options
+            )
         if permissions:
             settings += _("**Permissions:** {permissions}\n").format(permissions=permissions)
         if role.managed:
@@ -306,6 +383,14 @@ class RolePages(menus.ListPageSource):
                     name=_("Role settings for {role} (continued)").format(role=role.name),
                     value=page,
                 )
+        if role.display_icon:
+            if isinstance(role.display_icon, discord.Asset):
+                em.set_thumbnail(url=role.display_icon)
+            else:
+                cdn_fmt = " https://cdnjs.cloudflare.com/ajax/libs/twemoji/14.0.2/72x72/{codepoint:x}.png"
+                url = cdn_fmt.format(codepoint=ord(str(role.display_icon)))
+                log.verbose("RolePages role.display_icon: %s", role.display_icon)
+                em.set_thumbnail(url=url)
         em.set_footer(text=f"Page {menu.current_page + 1}/{self.get_max_pages()}")
         return em
 
@@ -315,8 +400,6 @@ class BaseMenu(discord.ui.View):
         self,
         source: menus.PageSource,
         cog: commands.Cog,
-        clear_reactions_after: bool = True,
-        delete_message_after: bool = False,
         timeout: int = 60,
         message: discord.Message = None,
         **kwargs: Any,
@@ -329,21 +412,29 @@ class BaseMenu(discord.ui.View):
         self.message = message
         self._source = source
         self.ctx = None
-        self.author = None
+        self.author: Optional[discord.Member] = None
         self.current_page = kwargs.get("page_start", 0)
         self.forward_button = ForwardButton(discord.ButtonStyle.grey, 0)
         self.back_button = BackButton(discord.ButtonStyle.grey, 0)
         self.first_item = FirstItemButton(discord.ButtonStyle.grey, 0)
         self.last_item = LastItemButton(discord.ButtonStyle.grey, 0)
         self.stop_button = StopButton(discord.ButtonStyle.red, 0)
+        self.add_item(self.stop_button)
         self.add_item(self.first_item)
         self.add_item(self.back_button)
         self.add_item(self.forward_button)
         self.add_item(self.last_item)
-        self.add_item(self.stop_button)
         if isinstance(source, RolePages):
             self.select_view = RoleToolsSelectOption()
             self.add_item(self.select_view)
+            self.auto = AutoToggleButton()
+            self.add_item(self.auto)
+            self.sticky = StickyToggleButton()
+            self.add_item(self.sticky)
+            self.selfassignable = SelfAddToggleButton()
+            self.add_item(self.selfassignable)
+            self.selfremovable = SelfRemToggleButton()
+            self.add_item(self.selfremovable)
 
     @property
     def source(self):
@@ -351,6 +442,29 @@ class BaseMenu(discord.ui.View):
 
     async def on_timeout(self):
         await self.message.edit(view=None)
+
+    def update_buttons(self, data: dict):
+        buttons = {
+            "sticky": self.sticky,
+            "auto": self.auto,
+            "selfassignable": self.selfassignable,
+            "selfremovable": self.selfremovable,
+        }
+        for key, button in buttons.items():
+            if key in data:
+                if data[key]:
+                    button.style = discord.ButtonStyle.green
+                else:
+                    button.style = discord.ButtonStyle.red
+            if self.author is not None:
+                if self.author.id == self.ctx.guild.owner_id:
+                    button.disabled = False
+                else:
+                    button.disabled = (
+                        self.author.guild_permissions.manage_roles
+                        and self.source.current_role >= self.author.top_role
+                    )
+            button.disabled |= not self.source.current_role.is_assignable()
 
     async def start(self, ctx: commands.Context):
         self.ctx = ctx
@@ -408,6 +522,68 @@ class BaseMenu(discord.ui.View):
             *interaction.client.owner_ids,
             getattr(self.author, "id", None),
         ):
+            await interaction.response.send_message(
+                content=_("You are not authorized to interact with this."), ephemeral=True
+            )
+            return False
+        return True
+
+
+class ConfirmView(discord.ui.View):
+    """
+    This is just a copy of my version from Red to be removed later possibly
+    https://github.com/Cog-Creators/Red-DiscordBot/pull/6176
+    """
+
+    def __init__(
+        self,
+        author: Optional[discord.abc.User] = None,
+        *,
+        timeout: float = 180.0,
+        disable_buttons: bool = False,
+    ):
+        if timeout is None:
+            raise TypeError("This view should not be used as a persistent view.")
+        super().__init__(timeout=timeout)
+        self.result: Optional[bool] = None
+        self.author: Optional[discord.abc.User] = author
+        self.message: Optional[discord.Message] = None
+        self.disable_buttons = disable_buttons
+
+    async def on_timeout(self):
+        if self.message is None:
+            # we can't do anything here if message is none
+            return
+
+        if self.disable_buttons:
+            self.confirm_button.disabled = True
+            self.dismiss_button.disabled = True
+            await self.message.edit(view=self)
+        else:
+            await self.message.edit(view=None)
+
+    @discord.ui.button(label=_("Yes"), style=discord.ButtonStyle.green)
+    async def confirm_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.result = True
+        self.stop()
+        # respond to the interaction so the user does not see "interaction failed".
+        await interaction.response.defer()
+        # call `on_timeout` explicitly here since it's not called when `stop()` is called.
+        await self.on_timeout()
+
+    @discord.ui.button(label=_("No"), style=discord.ButtonStyle.secondary)
+    async def dismiss_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.result = False
+        self.stop()
+        # respond to the interaction so the user does not see "interaction failed".
+        await interaction.response.defer()
+        # call `on_timeout` explicitly here since it's not called when `stop()` is called.
+        await self.on_timeout()
+
+    async def interaction_check(self, interaction: discord.Interaction):
+        if self.message is None:
+            self.message = interaction.message
+        if self.author and interaction.user.id != self.author.id:
             await interaction.response.send_message(
                 content=_("You are not authorized to interact with this."), ephemeral=True
             )

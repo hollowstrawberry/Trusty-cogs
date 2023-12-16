@@ -55,7 +55,7 @@ HEADER = (
     "{body}\n\n"
     "Any questions you can find [TrustyBot](https://discordapp.com/api/oauth2/authorize?client_id=268562382173765643&permissions=2146958583&scope=bot) and myself over on [my server](https://discord.gg/wVVrqej) or on the [Redbot Cog Support server](https://discord.gg/GET4DVk).\n"
     "## Credits\n"
-    "Thank you to everyone who has pushed me to think about new ideas and implement them.\n"
+    "Thank you to everyone who has pushed me to think about new ideas and implement them. Including but not limited to:\n{credits}\n"
 )
 
 
@@ -216,9 +216,7 @@ def edit(key, value):
 
 @cli.command()
 @click.option("--author", default=DEFAULT_AUTHOR, help="Author of the cog", prompt=True)
-@click.option(
-    "--name", prompt="Enter the name of the cog", help="Name of the cog being added"
-)
+@click.option("--name", prompt="Enter the name of the cog", help="Name of the cog being added")
 @click.option(
     "--description",
     prompt="Enter a longer description for the cog.",
@@ -261,21 +259,15 @@ def edit(key, value):
     prompt=True,
     type=bool,
 )
-@click.option(
-    "--required-cogs", default={}, help="Required cogs for this cog to function."
-)
-@click.option(
-    "--requirements", prompt=True, default=[], help="Requirements for the cog."
-)
+@click.option("--required-cogs", default={}, help="Required cogs for this cog to function.")
+@click.option("--requirements", prompt=True, default=[], help="Requirements for the cog.")
 @click.option(
     "--tags",
     default=[],
     prompt=True,
     help="Any tags to help people find the cog better.",
 )
-@click.option(
-    "--permissions", prompt=True, default=[], help="Any permissions the cog requires."
-)
+@click.option("--permissions", prompt=True, default=[], help="Any permissions the cog requires.")
 @click.option(
     "--min-python-version",
     default=[3, 8, 0],
@@ -336,7 +328,7 @@ def make(
         min_python_version,
         end_user_data_statement,
     )
-    log.debug(data_obj)
+    log.debug("make data_obj: %s", data_obj)
     save_json(f"{ROOT}/{name}/info.json", data_obj.__dict__)
 
 
@@ -347,21 +339,21 @@ def countlines(include_hidden: bool = False, include_disabled: bool = False):
     """Count the number of lines of .py files in all folders"""
     total = 0
     totals = []
-    log.debug(ROOT)
+    log.debug("countlines root: %s", ROOT)
     for folder in os.listdir(ROOT):
         cog_path = ROOT / folder
         cog = 0
         if folder.startswith("."):
             continue
         if not cog_path.is_dir():
-            log.debug(f"{cog_path} is not a directory")
+            log.debug("%s is not a directory", cog_path)
             continue
         try:
             with open(cog_path / "info.json", "r") as infile:
                 info = InfoJson.from_json(json.load(infile))
         except Exception:
             info = InfoJson(DEFAULT_AUTHOR, hidden=True, disabled=True)
-            log.debug(f"Error opening {cog_path} info.json")
+            log.debug("Error opening %s info.json", cog_path)
         if info.hidden and not include_hidden:
             continue
         if info.disabled and not include_disabled:
@@ -376,7 +368,7 @@ def countlines(include_hidden: bool = False, include_disabled: bool = False):
                 try:
                     with open(file_path, "r") as infile:
                         lines = len(infile.readlines())
-                        log.debug(f"{file_path} has {lines} lines of code")
+                        log.debug("%s has %s lines of code", file_path, lines)
                     cog += lines
                     total += lines
                 except Exception:
@@ -397,7 +389,7 @@ def countchars(include_hidden: bool = False, include_disabled: bool = False):
     """Count the number of lines of .py files in all folders"""
     total = 0
     totals = []
-    log.info(f"{ROOT}")
+    log.info("countchars %s", ROOT)
     for folder in os.listdir(f"{ROOT}/"):
         cog = 0
         if folder.startswith("."):
@@ -433,6 +425,7 @@ def countchars(include_hidden: bool = False, include_disabled: bool = False):
 def makereadme():
     """Generate README.md from info about all cogs"""
     table_data = []
+    authors = set()
     for folder in os.listdir(ROOT):
         if folder.startswith(".") or folder.startswith("_"):
             continue
@@ -456,12 +449,13 @@ def makereadme():
                         _version = maybe_version.group(1)
         if info and not (info.disabled or info.hidden):
             to_append = [info.name, _version]
-            description = (
-                f"<details><summary>{info.short}</summary>{info.description}</details>"
-            )
+            description = f"<details><summary>{info.short}</summary>{info.description}</details>"
             to_append.append(description)
             to_append.append(babel_list(info.author, style="standard", locale="en"))
             table_data.append(to_append)
+        if info:
+            for author in info.author:
+                authors.add(author)
 
     body = tabulate.tabulate(
         table_data,
@@ -473,8 +467,10 @@ def makereadme():
         ],
         tablefmt="github",
     )
+    authors.remove("TrustyJAID")
+    credits = "\n".join(f"- {i}" for i in sorted(authors))
     with open(f"{ROOT}/README.md", "w") as outfile:
-        outfile.write(HEADER.format(body=body))
+        outfile.write(HEADER.format(body=body, credits=credits))
 
 
 @cli.command()

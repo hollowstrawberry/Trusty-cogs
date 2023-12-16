@@ -1,14 +1,11 @@
-import asyncio
-import logging
 from typing import Optional, Union
 
 import discord
+from red_commons.logging import getLogger
 from redbot.core import commands
 from redbot.core.commands import Context
 from redbot.core.i18n import Translator
-from redbot.core.utils.chat_formatting import humanize_list, pagify
-from redbot.core.utils.menus import start_adding_reactions
-from redbot.core.utils.predicates import ReactionPredicate
+from redbot.core.utils.chat_formatting import pagify
 
 from .abc import RoleToolsMixin
 from .converter import RoleEmojiConverter, RoleHierarchyConverter
@@ -16,7 +13,7 @@ from .menus import BaseMenu, ReactRolePages
 
 roletools = RoleToolsMixin.roletools
 
-log = logging.getLogger("red.Trusty-cogs.RoleTools")
+log = getLogger("red.Trusty-cogs.RoleTools")
 _ = Translator("RoleTools", __file__)
 
 
@@ -271,31 +268,7 @@ class RoleToolsReactions(RoleToolsMixin):
                     "sure to add the emoji to the message for this to work."
                 )
             )
-        if not await self.config.role(role).selfassignable():
-            msg_str = _(
-                "{role} is not self assignable. Would you liked to make "
-                "it self assignable and self removeable?"
-            ).format(role=role.name, prefix=ctx.clean_prefix)
-            msg = await ctx.send(msg_str)
-            start_adding_reactions(msg, ReactionPredicate.YES_OR_NO_EMOJIS)
-            pred = ReactionPredicate.yes_or_no(msg, ctx.author)
-            try:
-                await ctx.bot.wait_for("reaction_add", check=pred, timeout=60)
-            except asyncio.TimeoutError:
-                await ctx.channel.send(
-                    _("Okay I won't automatically make {role} self assignable.").format(
-                        role=role.name
-                    )
-                )
-                return
-            if pred.result:
-                await self.config.role(role).selfassignable.set(True)
-                await self.config.role(role).selfremovable.set(True)
-                await ctx.channel.send(
-                    _("{role} has been made self assignable and self removeable.").format(
-                        role=role.name
-                    )
-                )
+        await self.confirm_selfassignable(ctx, [role])
 
     @react_coms.command(name="remove", aliases=["rem"], with_app_command=False)
     @commands.admin_or_permissions(manage_roles=True)
@@ -401,7 +374,7 @@ class RoleToolsReactions(RoleToolsMixin):
         send_to_react = False
         async with self.config.guild(ctx.guild).reaction_roles() as cur_setting:
             for role, emoji in role_emoji:
-                log.debug(type(emoji))
+                log.verbose("bulkreact emoji: %s", type(emoji))
                 if isinstance(emoji, discord.PartialEmoji):
                     use_emoji = str(emoji.id)
                 else:
@@ -465,28 +438,4 @@ class RoleToolsReactions(RoleToolsMixin):
             await ctx.send(msg)
 
         if ask_to_modify:
-            msg_str = _(
-                "Some roles are not self assignable. Would you liked to make "
-                "them self assignable and self removeable?"
-            ).format(role=role.name, prefix=ctx.clean_prefix)
-            msg = await ctx.send(msg_str)
-            start_adding_reactions(msg, ReactionPredicate.YES_OR_NO_EMOJIS)
-            pred = ReactionPredicate.yes_or_no(msg, ctx.author)
-            try:
-                await ctx.bot.wait_for("reaction_add", check=pred, timeout=60)
-            except asyncio.TimeoutError:
-                await ctx.send(
-                    _("Okay I won't automatically make {role} self assignable.").format(
-                        role=role.name
-                    )
-                )
-                return
-            if pred.result:
-                for key, role in added:
-                    await self.config.role(role).selfassignable.set(True)
-                    await self.config.role(role).selfremovable.set(True)
-                await ctx.send(
-                    _("{roles} have been made self assignable and self removeable.").format(
-                        roles=humanize_list([r for x, r in added])
-                    )
-                )
+            await self.confirm_selfassignable(ctx, [r[1] for r in added])

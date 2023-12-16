@@ -4,8 +4,10 @@ import logging
 import os
 import aiohttp
 import discord
-import youtube_dl
+import moviepy
+import yt_dlp as youtube_dl
 from moviepy.editor import CompositeVideoClip, TextClip, VideoFileClip
+from red_commons.logging import getLogger
 from redbot.core import checks, commands
 from redbot.core.data_manager import cog_data_path
 from discord.ext.commands import clean_content
@@ -19,7 +21,7 @@ CRAB_LINK = "https://youtu.be/gDLE3LikgUs"
 MIKU_LINK = "https://youtu.be/qeJjQGF6gz4"
 
 FONT_FILE = "https://github.com/matomo-org/travis-scripts/raw/master/fonts/Verdana.ttf"
-log = logging.getLogger("red.trusty-cogs.crabrave")
+log = getLogger("red.trusty-cogs.crabrave")
 
 
 class CrabRave(commands.Cog):
@@ -28,7 +30,7 @@ class CrabRave(commands.Cog):
     """
 
     __author__ = ["DankMemer Team", "TrustyJAID", "thisisjvgrace"]
-    __version__ = "1.1.2"
+    __version__ = "1.1.3"
 
     def __init__(self, bot):
         self.bot = bot
@@ -38,7 +40,12 @@ class CrabRave(commands.Cog):
         Thanks Sinbad!
         """
         pre_processed = super().format_help_for_context(ctx)
-        return f"{pre_processed}\n\nCog Version: {self.__version__}"
+        return (
+            f"{pre_processed}\n\n"
+            f"Cog Version: {self.__version__}\n"
+            f"yt-dlp Version: {youtube_dl.version.__version__}\n"
+            f"MoveiPy Version: {moviepy.version.__version__}"
+        )
 
     async def red_delete_data_for_user(self, **kwargs):
         """
@@ -54,9 +61,10 @@ class CrabRave(commands.Cog):
                     self.dl_from_youtube, link=link, name_template=name_template
                 )
                 task = loop.run_in_executor(None, task)
-                await asyncio.wait_for(task, timeout=60)
+                return await asyncio.wait_for(task, timeout=60)
             except asyncio.TimeoutError:
                 log.exception("Error downloading the crabrave video")
+                return False
             except Exception:
                 log.error("Error downloading crabrave video template", exc_info=True)
                 return False

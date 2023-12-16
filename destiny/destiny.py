@@ -1,8 +1,6 @@
 import asyncio
 import csv
 import datetime
-import functools
-import logging
 import random
 import re
 from io import BytesIO, StringIO
@@ -12,6 +10,7 @@ import aiohttp
 import discord
 from discord import app_commands
 from discord.ext import tasks
+from red_commons.logging import getLogger
 from redbot.core import Config, commands
 from redbot.core.i18n import Translator, cog_i18n
 from redbot.core.utils.chat_formatting import (
@@ -22,9 +21,10 @@ from redbot.core.utils.chat_formatting import (
 )
 from tabulate import tabulate
 
-from .api import DestinyAPI
+from .api import DestinyAPI, MyTyping
 from .converter import (
     DestinyActivity,
+    DestinyCharacter,
     DestinyClassType,
     DestinyComponents,
     DestinyComponentType,
@@ -55,7 +55,7 @@ IMAGE_URL = "https://www.bungie.net"
 AUTH_URL = "https://www.bungie.net/en/oauth/authorize"
 TOKEN_URL = "https://www.bungie.net/platform/app/oauth/token/"
 _ = Translator("Destiny", __file__)
-log = logging.getLogger("red.trusty-cogs.Destiny")
+log = getLogger("red.trusty-cogs.Destiny")
 
 
 @cog_i18n(_)
@@ -64,7 +64,7 @@ class Destiny(DestinyAPI, commands.Cog):
     Get information from the Destiny 2 API
     """
 
-    __version__ = "1.8.0"
+    __version__ = "1.9.0"
     __author__ = "TrustyJAID"
 
     def __init__(self, bot):
@@ -77,17 +77,22 @@ class Destiny(DestinyAPI, commands.Cog):
             "manifest_guild": None,
             "manifest_notified_version": None,
             "cache_manifest": 0,
+            "manifest_auto": False,
         }
         self.config = Config.get_conf(self, 35689771456)
         self.config.register_global(**default_global)
-        self.config.register_user(oauth={}, account={})
-        self.config.register_guild(clan_id=None, commands={})
+        self.config.register_user(oauth={}, account={}, characters={})
+        self.config.register_guild(clan_id=None, commands={}, news_channel=None, posted_news=[])
         self.throttle: float = 0
         self.dashboard_authed: Dict[int, dict] = {}
         self.session = aiohttp.ClientSession(headers={"User-Agent": "Red-TrustyCogs-DestinyCog"})
         self.manifest_check_loop.start()
+        self.news_checker.start()
         self._manifest: dict = {}
         self._loadout_temp: dict = {}
+        self._repo = ""
+        self._commit = ""
+        self._ready = asyncio.Event()
 
     async def cog_unload(self):
         try:
@@ -97,13 +102,31 @@ class Destiny(DestinyAPI, commands.Cog):
         if not self.session.closed:
             await self.session.close()
         self.manifest_check_loop.cancel()
+        self.news_checker.cancel()
+
+    async def cog_load(self):
+        if self.bot.user.id in DEV_BOTS:
+            try:
+                self.bot.add_dev_env_value("destiny", lambda x: self)
+            except Exception:
+                pass
+        loop = asyncio.get_running_loop()
+        loop.create_task(self.load_cache())
+        loop.create_task(self._get_commit())
 
     def format_help_for_context(self, ctx: commands.Context) -> str:
         """
         Thanks Sinbad!
         """
         pre_processed = super().format_help_for_context(ctx)
-        return f"{pre_processed}\n\nCog Version: {self.__version__}"
+        ret = f"{pre_processed}\n\n- Cog Version: {self.__version__}\n"
+        # we'll only have a repo if the cog was installed through Downloader at some point
+        if self._repo:
+            ret += f"- Repo: {self._repo}\n"
+        # we should have a commit if we have the repo but just incase
+        if self._commit:
+            ret += f"- Commit: [{self._commit[:9]}]({self._repo}/tree/{self._commit})"
+        return ret
 
     async def red_delete_data_for_user(
         self,
@@ -116,14 +139,73 @@ class Destiny(DestinyAPI, commands.Cog):
         """
         await self.config.user_from_id(user_id).clear()
 
+    async def _get_commit(self):
+        downloader = self.bot.get_cog("Downloader")
+        if not downloader:
+            return
+        cogs = await downloader.installed_cogs()
+        for cog in cogs:
+            if cog.name == "destiny":
+                if cog.repo is not None:
+                    self._repo = cog.repo.clean_url
+                self._commit = cog.commit
+
+    async def cog_before_invoke(self, ctx: commands.Context):
+        await self._ready.wait()
+        return True
+
     @commands.Cog.listener()
     async def on_oauth_receive(self, user_id: int, payload: dict):
         if payload["provider"] != "destiny":
             return
         if "code" not in payload:
-            log.error(f"Received Destiny OAuth without a code parameter {user_id} - {payload}")
+            log.error("Received Destiny OAuth without a code parameter %s - %s", user_id, payload)
             return
         self.dashboard_authed[int(user_id)] = payload
+
+    @tasks.loop(seconds=300)
+    async def news_checker(self):
+        try:
+            news = await self.get_news()
+        except Destiny2APIError as e:
+            log.error("Error checking Destiny news sources: %s", e)
+            return
+        if len(news.NewsArticles) < 1:
+            return
+        source = BungieNewsSource(news)
+        guilds = await self.config.all_guilds()
+        article_keys = [a.save_id() for a in news.NewsArticles]
+        for guild_id, data in guilds.items():
+            guild = self.bot.get_guild(guild_id)
+            if guild is None:
+                continue
+            channel = guild.get_channel(data["news_channel"])
+            if channel is None:
+                continue
+            if not channel.permissions_for(guild.me).send_messages:
+                continue
+            for article in news.NewsArticles:
+                if article.UniqueIdentifier in data["posted_news"]:
+                    # modify the data to include the new save ID here
+                    data["posted_news"].remove(article.UniqueIdentifier)
+                    data["posted_news"].append(article.save_id())
+                    continue
+                if article.save_id() in data["posted_news"]:
+                    continue
+                kwargs = await source.format_page(None, article)
+                if not channel.permissions_for(guild.me).embed_links:
+                    kwargs["embed"] = None
+                await channel.send(**kwargs)
+                data["posted_news"].append(article.save_id())
+            if len(data["posted_news"]) > 25:
+                for old in data["posted_news"].copy():
+                    if old not in article_keys and len(data["posted_news"]) > 25:
+                        data["posted_news"].remove(old)
+            await self.config.guild(guild).posted_news.set(data["posted_news"])
+
+    @news_checker.before_loop
+    async def before_news_checker(self):
+        await self.bot.wait_until_red_ready()
 
     @tasks.loop(seconds=3600)
     async def manifest_check_loop(self):
@@ -150,15 +232,67 @@ class Destiny(DestinyAPI, commands.Cog):
             return
         notify_version = await self.config.manifest_notified_version()
         if manifest_data["version"] != notify_version:
-            msg = _(
-                "There is a Destiny Manifest update available from {old_ver} to version {version}"
-            ).format(old_ver=manifest_version, version=manifest_data["version"])
-            await channel.send(msg)
             await self.config.manifest_notified_version.set(manifest_data["version"])
+            if await self.config.manifest_auto():
+                try:
+                    await self.get_manifest()
+                except Exception:
+                    return
+                msg = _("I have downloaded the latest Destiny Manifest: {version}").format(
+                    version=manifest_data["version"]
+                )
+                await channel.send(msg)
+            else:
+                msg = _(
+                    "There is a Destiny Manifest update available from {old_ver} to version {version}"
+                ).format(old_ver=manifest_version, version=manifest_data["version"])
+                await channel.send(msg)
 
     @commands.hybrid_group(name="destiny")
     async def destiny(self, ctx: commands.Context) -> None:
         """Get information from the Destiny 2 API"""
+
+    @destiny.group(name="set")
+    async def destiny_set(self, ctx: commands.Context) -> None:
+        """Setup for the Destiny cog"""
+
+    @destiny_set.command(name="news")
+    @commands.mod_or_permissions(manage_messages=True)
+    async def destiny_set_news(
+        self, ctx: commands.Context, channel: Optional[discord.TextChannel] = None
+    ):
+        """
+        Setup a channel to receive Destiny news articles automatically
+
+        - `<channel>` The channel you want news articles posted in.
+        """
+        if channel is not None:
+            if not channel.permissions_for(ctx.me).send_messages:
+                await ctx.send(
+                    _("I don't have permission to send messages in {channel}.").format(
+                        channel=channel.mention
+                    )
+                )
+                return
+            try:
+                news = await self.get_news()
+            except Destiny2APIError:
+                await ctx.send(
+                    _("There was an error getting the current news posts. Please try again later.")
+                )
+                return
+            current = [a.save_id() for a in news.NewsArticles]
+            await self.config.guild(ctx.guild).posted_news.set(current)
+            await self.config.guild(ctx.guild).news_channel.set(channel.id)
+            await ctx.send(
+                _("I will now post new Destiny articles in {channel}.").format(
+                    channel=channel.mention
+                )
+            )
+        else:
+            await self.config.guild(ctx.guild).posted_news.clear()
+            await self.config.guild(ctx.guild).news_channel.clear()
+            await ctx.send(_("I will no longer automaticall post news articles in this server."))
 
     async def send_error_msg(self, ctx: commands.Context, error: Exception):
         if isinstance(error, ServersUnavailable):
@@ -178,7 +312,7 @@ class Destiny(DestinyAPI, commands.Cog):
         """
         Remove your authorization to the destiny API on the bot
         """
-        async with ctx.typing():
+        async with MyTyping(ctx, ephemeral=False):
             await self.red_delete_data_for_user(requester="user", user_id=ctx.author.id)
         msg = _("Your authorization has been reset.")
         await ctx.send(msg)
@@ -203,7 +337,7 @@ class Destiny(DestinyAPI, commands.Cog):
         using `details`, `true`, or `stats` will show the weapons stat bars
         using `lore` here will instead display the weapons lore card instead if it exists.
         """
-        async with ctx.typing():
+        async with MyTyping(ctx, ephemeral=False):
             show_lore = True if details_or_lore is False else False
             if search.startswith("lore "):
                 search = search.replace("lore ", "")
@@ -227,7 +361,7 @@ class Destiny(DestinyAPI, commands.Cog):
                 await ctx.send(_("`{search}` could not be found.").format(search=search))
                 return
             embeds = []
-            # log.debug(items[0])
+            log.trace("Item: %s", items[0])
             for item_hash, item in items.items():
                 embed = discord.Embed()
 
@@ -250,7 +384,6 @@ class Destiny(DestinyAPI, commands.Cog):
                     + "\n\n"
                 )
                 if item["itemType"] in [3] and not show_lore:
-
                     stats_str = ""
                     rpm = ""
                     recoil = ""
@@ -338,7 +471,7 @@ class Destiny(DestinyAPI, commands.Cog):
         """
         if not await self.has_oauth(ctx):
             return
-        async with ctx.typing():
+        async with MyTyping(ctx, ephemeral=False):
             bungie_id = await self.config.user(ctx.author).oauth.membership_id()
             creds = await self.get_bnet_user(ctx.author, bungie_id)
             bungie_name = creds.get("uniqueName", "")
@@ -364,7 +497,7 @@ class Destiny(DestinyAPI, commands.Cog):
         """
         if not await self.has_oauth(ctx):
             return
-        async with ctx.typing():
+        async with MyTyping(ctx, ephemeral=False):
             if clan_id:
                 clan_re = re.compile(
                     r"(https:\/\/)?(www\.)?bungie\.net\/.*(groupid=(\d+))", flags=re.I
@@ -528,8 +661,7 @@ class Destiny(DestinyAPI, commands.Cog):
             ).format(prefix=prefix)
             await ctx.send(msg)
             return
-        async with ctx.typing():
-
+        async with MyTyping(ctx, ephemeral=False):
             clan = await self.get_clan_members(ctx.author, clan_id)
             headers = [
                 "Discord Name",
@@ -615,12 +747,11 @@ class Destiny(DestinyAPI, commands.Cog):
                 await ctx.channel.send(box(page, lang="css"))
 
     @destiny.command(name="reset")
-    @commands.mod_or_permissions(manage_channels=True)
     async def destiny_reset_time(self, ctx: commands.Context):
         """
         Show exactly when Weekyl and Daily reset is
         """
-        async with ctx.typing():
+        async with MyTyping(ctx, ephemeral=False):
             today = datetime.datetime.now(datetime.timezone.utc)
             tuesday = today + datetime.timedelta(days=((1 - today.weekday()) % 7))
             weekly = datetime.datetime(
@@ -652,7 +783,7 @@ class Destiny(DestinyAPI, commands.Cog):
         """
         Get the latest news articles from Bungie.net
         """
-        async with ctx.typing():
+        async with MyTyping(ctx, ephemeral=False):
             try:
                 news = await self.get_news()
             except Destiny2APIError as e:
@@ -710,6 +841,13 @@ class Destiny(DestinyAPI, commands.Cog):
         )
         return info
 
+    async def get_engram_tracker(self, user: discord.abc.User, char_id: str, chars: dict) -> str:
+        engram_tracker = await self.get_definition("DestinyInventoryItemDefinition", [1624697519])
+        eg = engram_tracker["1624697519"]
+        return await self.replace_string(
+            user, eg["displayProperties"]["description"], char_id, chars
+        )
+
     async def make_character_embed(
         self, user: discord.abc.User, char_id: str, chars: dict, player_currency: str
     ) -> discord.Embed:
@@ -742,14 +880,14 @@ class Destiny(DestinyAPI, commands.Cog):
         bnet_display_name = chars["profile"]["data"]["userInfo"]["bungieGlobalDisplayName"]
         bnet_code = chars["profile"]["data"]["userInfo"]["bungieGlobalDisplayNameCode"]
         bnet_name = f"{bnet_display_name}#{bnet_code}"
-        embed.set_author(name=bnet_name, icon_url=user.avatar.url)
+        embed.set_author(name=bnet_name, icon_url=user.display_avatar)
         # if "emblemPath" in char:
         # embed.set_thumbnail(url=IMAGE_URL + char["emblemPath"])
         if "emblemBackgroundPath" in char:
             embed.set_image(url=IMAGE_URL + char["emblemBackgroundPath"])
         if titles:
             # embed.add_field(name=_("Titles"), value=titles)
-            embed.set_author(name=f"{bnet_name} ({title_name})", icon_url=user.avatar.url)
+            embed.set_author(name=f"{bnet_name} ({title_name})", icon_url=user.display_avatar)
         # log.debug(data)
         stats_str = ""
         if chars["profileCommendations"]:
@@ -795,7 +933,10 @@ class Destiny(DestinyAPI, commands.Cog):
         embed = await self.get_char_colour(embed, char)
         if titles:
             embed.add_field(name=_("Titles"), value=titles)
-        embed.add_field(name=_("Current Currencies"), value=player_currency, inline=False)
+        # embed.add_field(name=_("Current Currencies"), value=player_currency, inline=False)
+        embed.add_field(
+            name=_("Engram Tracker"), value=await self.get_engram_tracker(user, char_id, chars)
+        )
         return embed
 
     @destiny.command()
@@ -805,7 +946,7 @@ class Destiny(DestinyAPI, commands.Cog):
         """
         if not await self.has_oauth(ctx):
             return
-        async with ctx.typing():
+        async with MyTyping(ctx, ephemeral=False):
             try:
                 chars = await self.get_characters(
                     ctx.author,
@@ -839,23 +980,79 @@ class Destiny(DestinyAPI, commands.Cog):
             source = PostmasterPages(postmasters)
             await BaseMenu(source, self).start(ctx)
 
-    # @destiny.command(name="com")
+    @destiny.command(name="commendations", aliases=["com"])
     async def commendations(self, ctx: commands.Context):
         """
         Show your commendation scores
         """
         if not await self.has_oauth(ctx):
             return
-        async with ctx.typing():
+        async with MyTyping(ctx, ephemeral=False):
             try:
-                chars = await self.get_characters(ctx.author)
+                components = DestinyComponents(DestinyComponentType.social_commendations)
+                chars = await self.get_characters(ctx.author, components=components)
                 await self.save(chars, "character.json")
             except Destiny2APIError as e:
                 log.error(e, exc_info=True)
                 await self.send_error_msg(ctx, e)
                 return
-            com = await self.get_commendation_scores(chars["profileCommendations"]["data"])
-        await ctx.send(com)
+            embed = await self.make_commendations_embed(chars)
+        await ctx.send(embed=embed)
+
+    async def make_commendations_embed(self, chars: dict) -> discord.Embed:
+        bnet_display_name = chars["profile"]["data"]["userInfo"]["bungieGlobalDisplayName"]
+        bnet_code = chars["profile"]["data"]["userInfo"]["bungieGlobalDisplayNameCode"]
+        bnet_name = f"{bnet_display_name}#{bnet_code}"
+        profile_commendations = chars["profileCommendations"]["data"]
+        commendation_nodes = await self.get_entities("DestinySocialCommendationNodeDefinition")
+        commendations = await self.get_entities("DestinySocialCommendationDefinition")
+        bar = await self.get_commendation_scores(chars["profileCommendations"]["data"])
+        given, received = profile_commendations["scoreDetailValues"]
+        total_score = profile_commendations["totalScore"]
+        description = _(
+            "Score: **{total_score}**\n{bar}\nGiven: {given} - Received: {received}"
+        ).format(total_score=total_score, bar=bar, given=given, received=received)
+        embed = discord.Embed(
+            title=_("{name} Commendations").format(name=bnet_name), description=description
+        )
+
+        scores = profile_commendations["commendationNodeScoresByHash"]
+        scores_total = sum(v for k, v in scores.items() if k != "1062358355")
+        emojis = {
+            "154475713": "🟩",  # Ally
+            "1341823550": "🟥",  # Fun
+            "4180748446": "🟧",  # Mastery
+            "1390663518": "🟦",  # Leadership
+        }
+        data = {}
+        for commendation_hash, number in profile_commendations["commendationScoresByHash"].items():
+            commendation = commendations.get(commendation_hash)
+            parent_hash = str(commendation["parentCommendationNodeHash"])
+            parent = commendation_nodes.get(parent_hash)
+            if parent is None:
+                continue
+            parent_name = parent["displayProperties"]["name"]
+            if parent_name not in data:
+                data[parent_name] = {"hash": parent_hash, "commendations": {}}
+            commendation_name = commendation["displayProperties"]["name"]
+            data[parent_name]["commendations"][commendation_name] = {
+                "number": number,
+                "hash": commendation_hash,
+            }
+        for name, info in data.items():
+            msg = ""
+            emoji = emojis.get(info["hash"])
+            score_value = profile_commendations["commendationNodeScoresByHash"].get(info["hash"])
+            percent = f"{score_value/scores_total:.0%}"
+            em_name = f"{emoji} {name} - {percent}"
+            total = 0
+            for com_name, details in info["commendations"].items():
+                number = details["number"]
+                total += number
+                msg += f"{com_name}: {number}\n"
+            full_msg = _("Total: {total}\n{each}").format(total=total, each=msg)
+            embed.add_field(name=em_name, value=full_msg, inline=False)
+        return embed
 
     async def get_commendation_scores(self, data: dict) -> str:
         emojis = {
@@ -885,7 +1082,7 @@ class Destiny(DestinyAPI, commands.Cog):
             return
         if not user:
             user = ctx.author
-        async with ctx.typing():
+        async with MyTyping(ctx, ephemeral=False):
             try:
                 chars = await self.get_characters(user)
                 await self.save(chars, "character.json")
@@ -920,14 +1117,9 @@ class Destiny(DestinyAPI, commands.Cog):
         """
         Find Destiny Lore
         """
-        async with ctx.typing():
+        async with MyTyping(ctx, ephemeral=False):
             try:
-                # the below is to prevent blocking reading the large
-                # ~130mb manifest files and save on API calls
-                task = functools.partial(self.get_entities, entity="DestinyLoreDefinition")
-                loop = asyncio.get_running_loop()
-                task = loop.run_in_executor(None, task)
-                data: dict = await asyncio.wait_for(task, timeout=60)
+                data = await self.get_entities("DestinyLoreDefinition")
             except Exception:
                 msg = _("The manifest needs to be downloaded for this to work.")
                 await ctx.send(msg)
@@ -970,7 +1162,7 @@ class Destiny(DestinyAPI, commands.Cog):
             name = data["displayProperties"]["name"]
             if current.lower() in name.lower():
                 choices.append(app_commands.Choice(name=name, value=name))
-        log.debug(len(choices))
+        log.trace("parse_search_lore choices: %s", len(choices))
         return choices[:25]
 
     @destiny.command(aliases=["whereisxûr"])
@@ -981,9 +1173,10 @@ class Destiny(DestinyAPI, commands.Cog):
         """
         if not await self.has_oauth(ctx):
             return
-        async with ctx.typing():
+        async with MyTyping(ctx, ephemeral=False):
             try:
                 chars = await self.get_characters(ctx.author)
+
                 # await self.save(chars, "characters.json")
             except Destiny2APIError as e:
                 # log.debug(e)
@@ -996,7 +1189,7 @@ class Destiny(DestinyAPI, commands.Cog):
                     xur_def = (
                         await self.get_definition("DestinyVendorDefinition", ["2190858386"])
                     )["2190858386"]
-                except Destiny2APIError as e:
+                except Destiny2APIError:
                     log.error("I can't seem to see Xûr at the moment")
                     today = datetime.datetime.now(tz=datetime.timezone.utc)
                     friday = today.replace(hour=17, minute=0, second=0) + datetime.timedelta(
@@ -1026,7 +1219,7 @@ class Destiny(DestinyAPI, commands.Cog):
     async def xur(
         self,
         ctx: commands.Context,
-        character_class: Optional[DestinyClassType] = None,
+        character: Optional[discord.app_commands.Transform[str, DestinyCharacter]] = None,
     ) -> None:
         """
         Display a menu of Xûr's current wares
@@ -1035,29 +1228,26 @@ class Destiny(DestinyAPI, commands.Cog):
         """
         if not await self.has_oauth(ctx):
             return
-        await self.vendor_menus(ctx, character_class, "2190858386")
+        await self.vendor_menus(ctx, "2190858386", character)
 
     async def vendor_menus(
         self,
         ctx: commands.Context,
-        character_class: Optional[DestinyClassType],
         vendor_id: str,
+        character: Optional[str] = None,
     ):
-        async with ctx.typing():
-            try:
-                chars = await self.get_characters(ctx.author)
-                await self.save(chars, "characters.json")
-            except Destiny2APIError as e:
-                # log.debug(e)
-                await self.send_error_msg(ctx, e)
-                return
-            char_id = None
-            if character_class is not None:
-                for character_id, data in chars["characters"]["data"].items():
-                    if DestinyClassType(data["classType"]) == character_class:
-                        char_id = character_id
-            if char_id is None:
-                char_id = list(chars["characters"]["data"].keys())[0]
+        async with MyTyping(ctx, ephemeral=False):
+            char_id = character
+            if character is None:
+                try:
+                    chars = await self.get_characters(ctx.author)
+                    char_id = list(chars["characters"]["data"].keys())[0]
+
+                    await self.save(chars, "characters.json")
+                except Destiny2APIError as e:
+                    # log.debug(e)
+                    await self.send_error_msg(ctx, e)
+                    return
             try:
                 vendor = await self.get_vendor(ctx.author, char_id, vendor_id)
                 vendor_def = (await self.get_definition("DestinyVendorDefinition", [vendor_id]))[
@@ -1065,7 +1255,7 @@ class Destiny(DestinyAPI, commands.Cog):
                 ]
                 await self.save(vendor, "vendor.json")
                 await self.save(vendor_def, "vendor_def.json")
-            except Destiny2APIError as e:
+            except Destiny2APIError:
                 if vendor_id == "2190858386":
                     log.error("I can't seem to see Xûr at the moment")
                     today = datetime.datetime.now(tz=datetime.timezone.utc)
@@ -1211,9 +1401,9 @@ class Destiny(DestinyAPI, commands.Cog):
                         cost_str += f"{qty} {mat_name}\n"
                 except IndexError:
                     cost_str = ""
-                msg = f"{tier_type_url}{stats_str}{perks}{cost_str}{refresh_str}"
-                if not msg:
-                    msg = item["displayProperties"]["description"]
+                item_description = item["displayProperties"]["description"] + "\n"
+                msg = f"{tier_type_url}{item_description}{stats_str}{perks}{cost_str}{refresh_str}"
+                msg = await self.replace_string(ctx.author, msg)
                 item_embed.description = msg[:4096]
                 if item_type.value not in main_page:
                     main_page[item_type.value] = {}
@@ -1249,7 +1439,9 @@ class Destiny(DestinyAPI, commands.Cog):
     @vendor.command()
     @commands.bot_has_permissions(embed_links=True)
     async def eververse(
-        self, ctx: commands.Context, character_class: Optional[DestinyClassType] = None
+        self,
+        ctx: commands.Context,
+        character: Optional[discord.app_commands.Transform[str, DestinyCharacter]] = None,
     ) -> None:
         """
         Display items currently available on the Eververse in a menu.
@@ -1258,12 +1450,14 @@ class Destiny(DestinyAPI, commands.Cog):
         """
         if not await self.has_oauth(ctx):
             return
-        await self.vendor_menus(ctx, character_class, "3361454721")
+        await self.vendor_menus(ctx, "3361454721", character)
 
     @vendor.command()
     @commands.bot_has_permissions(embed_links=True)
     async def rahool(
-        self, ctx: commands.Context, character_class: Optional[DestinyClassType] = None
+        self,
+        ctx: commands.Context,
+        character: Optional[discord.app_commands.Transform[str, DestinyCharacter]] = None,
     ) -> None:
         """
         Display Rahool's wares.
@@ -1272,12 +1466,14 @@ class Destiny(DestinyAPI, commands.Cog):
         """
         if not await self.has_oauth(ctx):
             return
-        await self.vendor_menus(ctx, character_class, "2255782930")
+        await self.vendor_menus(ctx, "2255782930", character)
 
     @vendor.command(name="banshee-44", aliases=["banshee"])
     @commands.bot_has_permissions(embed_links=True)
     async def banshee(
-        self, ctx: commands.Context, character_class: Optional[DestinyClassType] = None
+        self,
+        ctx: commands.Context,
+        character: Optional[discord.app_commands.Transform[str, DestinyCharacter]] = None,
     ) -> None:
         """
         Display Banshee-44's wares.
@@ -1286,12 +1482,14 @@ class Destiny(DestinyAPI, commands.Cog):
         """
         if not await self.has_oauth(ctx):
             return
-        await self.vendor_menus(ctx, character_class, "672118013")
+        await self.vendor_menus(ctx, "672118013", character)
 
     @vendor.command(name="ada-1", aliases=["ada"])
     @commands.bot_has_permissions(embed_links=True)
     async def ada_1_inventory(
-        self, ctx: commands.Context, character_class: Optional[DestinyClassType] = None
+        self,
+        ctx: commands.Context,
+        character: Optional[discord.app_commands.Transform[str, DestinyCharacter]] = None,
     ) -> None:
         """
         Display Ada-1's wares
@@ -1300,12 +1498,14 @@ class Destiny(DestinyAPI, commands.Cog):
         """
         if not await self.has_oauth(ctx):
             return
-        await self.vendor_menus(ctx, character_class, "350061650")
+        await self.vendor_menus(ctx, "350061650", character)
 
     @vendor.command(name="saint-14", aliases=["saint"])
     @commands.bot_has_permissions(embed_links=True)
     async def saint_14_inventory(
-        self, ctx: commands.Context, character_class: Optional[DestinyClassType] = None
+        self,
+        ctx: commands.Context,
+        character: Optional[discord.app_commands.Transform[str, DestinyCharacter]] = None,
     ) -> None:
         """
         Display Saint-14's wares
@@ -1314,7 +1514,7 @@ class Destiny(DestinyAPI, commands.Cog):
         """
         if not await self.has_oauth(ctx):
             return
-        await self.vendor_menus(ctx, character_class, "765357505")
+        await self.vendor_menus(ctx, "765357505", character)
 
     @vendor.command(name="search")
     @commands.bot_has_permissions(embed_links=True)
@@ -1322,7 +1522,7 @@ class Destiny(DestinyAPI, commands.Cog):
         self,
         ctx: commands.Context,
         vendor: str,
-        character_class: Optional[DestinyClassType] = None,
+        character: Optional[discord.app_commands.Transform[str, DestinyCharacter]] = None,
     ) -> None:
         """
         Display any vendors wares.
@@ -1334,11 +1534,10 @@ class Destiny(DestinyAPI, commands.Cog):
         if not vendor.isdigit():
             possible_options = await self.search_definition("DestinyVendorDefinition", vendor)
             vendor = list(possible_options.keys())[0]
-        await self.vendor_menus(ctx, character_class, vendor)
+        await self.vendor_menus(ctx, vendor, character)
 
     @vendor_search.autocomplete("vendor")
     async def find_vendor(self, interaction: discord.Interaction, current: str):
-
         possible_options = await self.search_definition("DestinyVendorDefinition", current)
         choices = []
         for key, choice in possible_options.items():
@@ -1382,29 +1581,35 @@ class Destiny(DestinyAPI, commands.Cog):
         Get a random Exotic Weapon or choose a specific Class
         to get a random armour piece
         """
-        item = await self.get_random_item(weapons_or_class, 6)
-        em = discord.Embed(title=item["displayProperties"]["name"], colour=0xF1C40F)
-        if "flavorText" in item:
-            em.description = item["flavorText"]
-        if item["displayProperties"]["hasIcon"]:
-            em.set_thumbnail(url=IMAGE_URL + item["displayProperties"]["icon"])
-        if "screenshot" in item:
-            em.set_image(url=IMAGE_URL + item["screenshot"])
+        async with MyTyping(ctx, ephemeral=False):
+            item = await self.get_random_item(weapons_or_class, 6)
+            em = discord.Embed(title=item["displayProperties"]["name"], colour=0xF1C40F)
+            if "flavorText" in item:
+                em.description = item["flavorText"]
+            if item["displayProperties"]["hasIcon"]:
+                em.set_thumbnail(url=IMAGE_URL + item["displayProperties"]["icon"])
+            if "screenshot" in item:
+                em.set_image(url=IMAGE_URL + item["screenshot"])
         await ctx.send(embed=em)
 
     @destiny.command(name="nightfall", aliases=["nf"])
-    async def d2_nightfall(self, ctx: commands.Context):
+    async def d2_nightfall(
+        self,
+        ctx: commands.Context,
+        character: Optional[discord.app_commands.Transform[str, DestinyCharacter]] = None,
+    ):
         """
         Get information about this weeks Nightfall activity
         """
         user = ctx.author
         if not await self.has_oauth(ctx):
             return
-        async with ctx.typing():
+        async with MyTyping(ctx, ephemeral=False):
             embeds = []
             try:
                 milestones = await self.get_milestones(user)
                 chars = await self.get_characters(user)
+
                 await self.save(milestones, "milestones.json")
             except Destiny2APIError as e:
                 await self.send_error_msg(ctx, e)
@@ -1414,12 +1619,14 @@ class Destiny(DestinyAPI, commands.Cog):
             activities = {nf["activityHash"]: nf for nf in milestones["1942283261"]["activities"]}
             nf_hashes = {}
             for char_id, av in chars["characterActivities"]["data"].items():
+                if character and character != char_id:
+                    continue
                 for act in av["availableActivities"]:
                     if act["activityHash"] in activities:
                         nf_hashes[act["activityHash"]] = act
 
             for nf_id, nf in nf_hashes.items():
-                embed = await self.make_activity_embed(ctx, nf_id, nf)
+                embed = await self.make_activity_embed(ctx, nf_id, nf, chars)
                 if embed is not None:
                     embeds.append(embed)
 
@@ -1435,19 +1642,104 @@ class Destiny(DestinyAPI, commands.Cog):
             page_start=0,
         ).start(ctx=ctx)
 
+    @destiny.command(name="activities")
+    async def d2_activities(
+        self,
+        ctx: commands.Context,
+        character: Optional[discord.app_commands.Transform[str, DestinyCharacter]] = None,
+    ):
+        """
+        Get information about available activities
+        """
+        user = ctx.author
+        if not await self.has_oauth(ctx):
+            return
+        async with MyTyping(ctx, ephemeral=False):
+            embeds = []
+            try:
+                milestones = await self.get_milestones(user)
+                chars = await self.get_characters(user)
+
+                await self.save(milestones, "milestones.json")
+            except Destiny2APIError as e:
+                await self.send_error_msg(ctx, e)
+                return
+            for char_id, av in chars["characterActivities"]["data"].items():
+                if character and character != char_id:
+                    continue
+                for act in av["availableActivities"]:
+                    embed = await self.make_activity_embed(ctx, act["activityHash"], act, chars)
+                    if embed is not None:
+                        embeds.append(embed)
+
+                # embed.add_field(name=name, value=mod_string[:1024])
+            # embed.title = nf_desc
+
+        await BaseMenu(
+            source=BasePages(
+                pages=embeds,
+                use_author=True,
+            ),
+            cog=self,
+            page_start=0,
+        ).start(ctx=ctx)
+
+    async def check_character_completion(self, activity_hash: int, chars: dict) -> str:
+        msg = ""
+        class_info = await self.get_entities("DestinyClassDefinition")
+        emojis = {
+            True: "✅",
+            False: "❌",
+        }
+        reset = ""
+        for char_id, data in chars["characterProgressions"]["data"].items():
+            class_name = (
+                class_info[str(chars["characters"]["data"][char_id]["classHash"])]
+                .get("displayProperties", {})
+                .get("name", "")
+            )
+            done = ""
+            for ms_hash, ms in data["milestones"].items():
+                for activity in ms.get("activities", []):
+                    if activity["activityHash"] != activity_hash:
+                        continue
+                    if "endDate" in ms:
+                        reset_dt = datetime.datetime.strptime(
+                            ms["endDate"], "%Y-%m-%dT%H:%M:%SZ"
+                        ).replace(tzinfo=datetime.timezone.utc)
+                        reset = discord.utils.format_dt(reset_dt, "R")
+                    if "phases" in activity:
+                        done = "-".join(emojis[phase["complete"]] for phase in activity["phases"])
+                        msg += f"{class_name}\n{done}\n"
+                    elif "challenges" in activity:
+                        is_complete = activity["challenges"][0]["objective"]["complete"]
+                        done = emojis[is_complete]
+                        msg += f"{class_name} - {done}\n"
+                    else:
+                        msg += f"{class_name} - ✅"
+
+                        # done = emojis[activity["isCompleted"]]
+
+        if reset:
+            msg += _("Resets {reset}\n").format(reset=reset)
+        return msg
+
     async def make_activity_embed(
-        self, ctx: commands.Context, activity_hash: int, activity_data: dict
+        self, ctx: commands.Context, activity_hash: int, activity_data: dict, chars: dict
     ) -> Optional[discord.Embed]:
         activity = await self.get_definition("DestinyActivityDefinition", [activity_hash])
         activity = activity[str(activity_hash)]
-        mod_hashes = activity_data["modifierHashes"]
-        mods = await self.get_definition("DestinyActivityModifierDefinition", mod_hashes)
+        mod_hashes = activity_data.get("modifierHashes", [])
+        mods = None
+        if mod_hashes:
+            mods = await self.get_definition("DestinyActivityModifierDefinition", mod_hashes)
         ssdp = activity.get("selectionScreenDisplayProperties", {}).get("description", "") + "\n"
         mod_string = ""
         if ssdp:
             mod_string += ssdp
-        recommended_power = activity_data["recommendedLight"]
-        mod_string += _("Recommended Power Level: {power}\n").format(power=recommended_power)
+        if "recommendedLight" in activity_data:
+            recommended_power = activity_data["recommendedLight"]
+            mod_string += _("Recommended Power Level: {power}\n").format(power=recommended_power)
         embed = discord.Embed(
             colour=await self.bot.get_embed_colour(ctx),
         )
@@ -1462,18 +1754,19 @@ class Destiny(DestinyAPI, commands.Cog):
             embed.set_author(name=name)
         if "pgcrImage" in activity:
             embed.set_image(url=IMAGE_URL + activity["pgcrImage"])
-        for mod in mods.values():
-            mod_name = mod["displayProperties"]["name"]
-            if not mod_name:
-                continue
-            if not mod["displayInActivitySelection"] and mod["displayInNavMode"]:
-                continue
-            mod_desc = re.sub(r"\W?\[[^\[\]]+\]", "", mod["displayProperties"]["description"])
-            mod_desc = await self.replace_string(ctx.author, mod_desc)
-            mod_icon = IMAGE_URL
+        if mods:
+            for mod in mods.values():
+                mod_name = mod["displayProperties"]["name"]
+                if not mod_name:
+                    continue
+                if not mod["displayInActivitySelection"] and mod["displayInNavMode"]:
+                    continue
+                mod_desc = re.sub(r"\W?\[[^\[\]]+\]", "", mod["displayProperties"]["description"])
+                mod_desc = await self.replace_string(ctx.author, mod_desc)
+                mod_icon = IMAGE_URL
 
-            mod_string += f"- [{mod_name}]({mod_icon} '{mod_desc}')\n"
-            # mod_string += f"> {mod_name}\n {mod_desc}\n\n"
+                mod_string += f"- [{mod_name}]({mod_icon} '{mod_desc}')\n"
+                # mod_string += f"> {mod_name}\n {mod_desc}\n\n"
         if activity["rewards"]:
             reward_hashes = set()
             for reward_type in activity["rewards"]:
@@ -1485,9 +1778,156 @@ class Destiny(DestinyAPI, commands.Cog):
             msg = ""
             for reward_hash, data in rewards.items():
                 msg += data["displayProperties"]["name"] + "\n"
+            msg = await self.replace_string(ctx.author, msg)
             embed.add_field(name=_("Rewards"), value=msg)
+        completion = await self.check_character_completion(activity_hash, chars)
+        if completion:
+            embed.add_field(name=_("Completion"), value=completion)
         embed.description = mod_string
         return embed
+
+    # @destiny.command(name="dungeons")
+    async def dungeons(self, ctx: commands.Context):
+        """
+        Show your current Dungeon completion state
+        """
+        if not await self.has_oauth(ctx):
+            return
+        raid_milestones = {
+            "422102671",  # Shattered Throne
+            "1742973996",  # Pit of Heresy
+            "478604913",  # Prophecy
+            "1092691445",  # Grasp of Avarice
+            "3618845105",  # Duality
+            "526718853",  # Spire of the Watcher
+        }
+        async with MyTyping(ctx, ephemeral=False):
+            ms_defs = await self.get_definition(
+                "DestinyMilestoneDefinition", list(raid_milestones)
+            )
+            try:
+                chars = await self.get_characters(ctx.author)
+            except Destiny2APIError as e:
+                await self.send_error_msg(ctx, e)
+                return
+            em = discord.Embed()
+            em.set_author(name=_("Raid Completion State"))
+            act_hashes = [
+                r["activityHash"] for act in ms_defs.values() for r in act.get("activities", [])
+            ]
+            activities = await self.get_definition("DestinyActivityDefinition", act_hashes)
+            embeds = []
+            for raid in ms_defs.values():
+                msg = ""
+                raid_name = raid.get("displayProperties", {}).get("name")
+                for act in raid.get("activities", []):
+                    raid_hash = act["activityHash"]
+                    completion = await self.check_character_completion(raid_hash, chars)
+                    if not completion:
+                        continue
+                    current_act = act
+                    embeds.append(
+                        await self.make_activity_embed(ctx, raid_hash, current_act, chars)
+                    )
+                    activity_name = (
+                        activities.get(str(raid_hash)).get("displayProperties", {}).get("name")
+                    )
+                    activity_description = (
+                        activities.get(str(raid_hash))
+                        .get("displayProperties", {})
+                        .get("description")
+                    )
+                    if activities.get(str(raid_hash)).get("tier") == -1:
+                        activity_description = activity_name.split(":")[-1]
+                    msg += f"**{activity_description}**\n{completion}"
+                em.add_field(name=raid_name, value=msg)
+                icon = raid.get("displayProperties", {}).get("icon")
+                if icon:
+                    em.set_thumbnail(url=f"{IMAGE_URL}{icon}")
+            embeds.insert(0, em)
+        await BaseMenu(
+            source=BasePages(
+                pages=embeds,
+                use_author=True,
+            ),
+            cog=self,
+            page_start=0,
+        ).start(ctx=ctx)
+
+    @destiny.command(name="raids")
+    async def raids(self, ctx: commands.Context):
+        """
+        Show your current raid completion state
+        """
+        if not await self.has_oauth(ctx):
+            return
+        raid_milestones = {
+            "3181387331",  # Last Wish
+            "2712317338",  # Garden of Salvation
+            "541780856",  # Deep Stone Crypt
+            "1888320892",  # Vault of Glass
+            "2136320298",  # Vow of the Disciple
+            "292102995",  # King's Fall
+            "3699252268",  # Root of Nightmares
+        }
+        async with MyTyping(ctx, ephemeral=False):
+            ms_defs = await self.get_definition(
+                "DestinyMilestoneDefinition", list(raid_milestones)
+            )
+            try:
+                chars = await self.get_characters(ctx.author)
+            except Destiny2APIError as e:
+                await self.send_error_msg(ctx, e)
+                return
+            em = discord.Embed()
+            em.set_author(name=_("Raid Completion State"))
+            act_hashes = [
+                r["activityHash"] for act in ms_defs.values() for r in act.get("activities", [])
+            ]
+            activities = await self.get_definition("DestinyActivityDefinition", act_hashes)
+            embeds = []
+            for raid in ms_defs.values():
+                msg = ""
+                raid_name = raid.get("displayProperties", {}).get("name")
+                for act in raid.get("activities", []):
+                    raid_hash = act["activityHash"]
+                    completion = await self.check_character_completion(raid_hash, chars)
+                    if not completion:
+                        continue
+                    current_act = act
+                    for char_id, data in chars["characterProgressions"]["data"].items():
+                        ms = data["milestones"].get(str(raid["hash"]))
+                        for actual_act in ms.get("activities", []):
+                            if act["activityHash"] == actual_act["activityHash"]:
+                                current_act = actual_act
+                                break
+                    embeds.append(
+                        await self.make_activity_embed(ctx, raid_hash, current_act, chars)
+                    )
+                    activity_name = (
+                        activities.get(str(raid_hash)).get("displayProperties", {}).get("name")
+                    )
+                    activity_description = (
+                        activities.get(str(raid_hash))
+                        .get("displayProperties", {})
+                        .get("description")
+                    )
+                    if activities.get(str(raid_hash)).get("tier") == -1:
+                        activity_description = activity_name.split(":")[-1]
+                    msg += f"**{activity_description}**\n{completion}"
+                em.add_field(name=raid_name, value=msg)
+                icon = raid.get("displayProperties", {}).get("icon")
+                if icon:
+                    em.set_thumbnail(url=f"{IMAGE_URL}{icon}")
+            embeds.insert(0, em)
+        await BaseMenu(
+            source=BasePages(
+                pages=embeds,
+                use_author=True,
+            ),
+            cog=self,
+            page_start=0,
+        ).start(ctx=ctx)
 
     @destiny.command(name="dares")
     async def d2_dares(self, ctx: commands.Context):
@@ -1497,9 +1937,9 @@ class Destiny(DestinyAPI, commands.Cog):
         user = ctx.author
         if not await self.has_oauth(ctx):
             return
-        async with ctx.typing():
+        async with MyTyping(ctx, ephemeral=False):
             try:
-                characters = await self.get_characters(user)
+                chars = await self.get_characters(user)
             except Destiny2APIError as e:
                 await self.send_error_msg(ctx, e)
                 return
@@ -1507,14 +1947,14 @@ class Destiny(DestinyAPI, commands.Cog):
             dares_hash = 1030714181
             activity = await self.get_definition("DestinyActivityDefinition", [dares_hash])
             activity = activity[str(dares_hash)]
-            for char_id, av in characters["characterActivities"]["data"].items():
+            for char_id, av in chars["characterActivities"]["data"].items():
                 for act in av["availableActivities"]:
                     if act["activityHash"] == dares_hash:
                         acts = act
             if acts is None:
                 await ctx.send(_("I could not find any Dares of Eternity information."))
                 return
-            embed = await self.make_activity_embed(ctx, dares_hash, acts)
+            embed = await self.make_activity_embed(ctx, dares_hash, acts, chars)
         await ctx.send(embed=embed)
 
     @destiny.command(name="craftable")
@@ -1526,9 +1966,10 @@ class Destiny(DestinyAPI, commands.Cog):
         if not await self.has_oauth(ctx):
             return
         embeds = []
-        async with ctx.typing():
+        async with MyTyping(ctx, ephemeral=False):
             try:
                 chars = await self.get_characters(user)
+
                 await self.save(chars, "character.json")
             except Destiny2APIError as e:
                 log.error(e, exc_info=True)
@@ -1560,7 +2001,7 @@ class Destiny(DestinyAPI, commands.Cog):
                 if not any(i in v.get("parentNodeHashes", []) for i in weapon_slots):
                     continue
                 presentation_node_hashes.add(int(k))
-            log.debug(f"Presentation Node {presentation_node_hashes}")
+            log.trace("Presentation Node %s", presentation_node_hashes)
             msg = ""
             for r_hash, i in weapon_info.items():
                 if not any(h in i.get("parentNodeHashes", []) for h in presentation_node_hashes):
@@ -1687,7 +2128,7 @@ class Destiny(DestinyAPI, commands.Cog):
     async def loadout_equip(
         self,
         ctx: commands.Context,
-        character: DestinyClassType,
+        character: discord.app_commands.Transform[str, DestinyCharacter],
         loadout: int,
     ):
         """
@@ -1699,7 +2140,7 @@ class Destiny(DestinyAPI, commands.Cog):
         if not await self.has_oauth(ctx):
             return
         loadout -= 1
-        async with ctx.typing():
+        async with MyTyping(ctx, ephemeral=False):
             try:
                 components = DestinyComponents(
                     DestinyComponentType.characters, DestinyComponentType.character_loadouts
@@ -1707,13 +2148,9 @@ class Destiny(DestinyAPI, commands.Cog):
                 chars = None
                 if ctx.author.id in self._loadout_temp:
                     chars = self._loadout_temp[ctx.author.id]
-                    if datetime.datetime.now(
-                        datetime.timezone.utc
-                    ) - datetime.datetime.fromisoformat(
-                        chars["responseMintedTimestamp"]
-                    ) > datetime.timedelta(
-                        minutes=5
-                    ):
+                    if datetime.datetime.now(datetime.timezone.utc) - datetime.datetime.strptime(
+                        chars["responseMintedTimestamp"], "%Y-%m-%dT%H:%M:%S.%fZ"
+                    ).replace(tzinfo=datetime.timezone.utc) > datetime.timedelta(minutes=5):
                         chars = None
                 if chars is None:
                     try:
@@ -1724,13 +2161,7 @@ class Destiny(DestinyAPI, commands.Cog):
                         await self.send_error_msg(ctx, e)
                         return
                     self._loadout_temp[ctx.author.id] = chars
-                for char, data in chars["characters"]["data"].items():
-                    if character and data["classType"] == character.value:
-                        character_id = char
-                        break
-                    else:
-                        character_id = char
-                        break
+                character_id = character
                 membership_type = chars["characters"]["data"][character_id]["membershipType"]
             except Destiny2APIError as e:
                 await self.send_error_msg(ctx, e)
@@ -1762,14 +2193,13 @@ class Destiny(DestinyAPI, commands.Cog):
         chars = None
         if interaction.user.id in self._loadout_temp:
             chars = self._loadout_temp[interaction.user.id]
-            if datetime.datetime.now(datetime.timezone.utc) - datetime.datetime.fromisoformat(
-                chars["responseMintedTimestamp"]
-            ) > datetime.timedelta(minutes=5):
+            if datetime.datetime.now(datetime.timezone.utc) - datetime.datetime.strptime(
+                chars["responseMintedTimestamp"], "%Y-%m-%dT%H:%M:%S.%fZ"
+            ).replace(tzinfo=datetime.timezone.utc) > datetime.timedelta(minutes=5):
                 chars = None
         if chars is None:
             try:
                 chars = await self.get_characters(interaction.user, components)
-                await self.save(chars, "character.json")
             except Destiny2APIError:
                 return [
                     app_commands.Choice(
@@ -1777,30 +2207,20 @@ class Destiny(DestinyAPI, commands.Cog):
                     )
                 ]
             self._loadout_temp[interaction.user.id] = chars
-        character_type = interaction.namespace.character
-
-        for char, data in chars["characters"]["data"].items():
-            if character_type and data["classType"] == character_type:
-                character_id = char
-                break
-            else:
-                character_id = char
-                break
-        log.info(f"{character_type=} {character_id}")
+        character_id = interaction.namespace.character
+        # log.info(f"{character_id=}")
         choices = []
         for index, loadout in enumerate(
             chars["characterLoadouts"]["data"][str(character_id)]["loadouts"]
         ):
-            name = loadout_names.get(str(loadout["nameHash"]), {"name": _("Empty Loadout")})[
-                "name"
-            ]
+            name = loadout_names.get(str(loadout["nameHash"]), {}).get("name", _("Empty Loadout"))
             full_name = f"{index+1}. {name}"
             if current.lower() in full_name.lower():
                 choices.append(app_commands.Choice(name=full_name, value=index + 1))
         return choices[:25]
 
     @loadout.command(name="view")
-    async def loadout_view(self, ctx: commands.Context, full: Optional[bool] = False) -> None:
+    async def loadout_view(self, ctx: commands.Context) -> None:
         """
         Display a menu of each character's equipped weapons and their info
 
@@ -1810,9 +2230,10 @@ class Destiny(DestinyAPI, commands.Cog):
         user = ctx.author
         if not await self.has_oauth(ctx, user):
             return
-        async with ctx.typing():
+        async with MyTyping(ctx, ephemeral=False):
             try:
                 chars = await self.get_characters(user)
+
             except Destiny2APIError as e:
                 # log.debug(e)
                 await self.send_error_msg(ctx, e)
@@ -1837,9 +2258,10 @@ class Destiny(DestinyAPI, commands.Cog):
         user = ctx.author
         if not await self.has_oauth(ctx, user):
             return
-        async with ctx.typing():
+        async with MyTyping(ctx, ephemeral=False):
             try:
                 chars = await self.get_characters(user)
+
             except Destiny2APIError as e:
                 # log.debug(e)
                 await self.send_error_msg(ctx, e)
@@ -1890,12 +2312,14 @@ class Destiny(DestinyAPI, commands.Cog):
                     except KeyError:
                         pass
                 embed = discord.Embed(title=info)
-                embed.set_author(name=bnet_name, icon_url=user.avatar.url)
+                embed.set_author(name=bnet_name, icon_url=user.display_avatar)
                 if "emblemPath" in char:
                     embed.set_thumbnail(url=IMAGE_URL + char["emblemPath"])
                 if titles:
                     # embed.add_field(name=_("Titles"), value=titles)
-                    embed.set_author(name=f"{bnet_name} ({title_name})", icon_url=user.avatar.url)
+                    embed.set_author(
+                        name=f"{bnet_name} ({title_name})", icon_url=user.display_avatar
+                    )
                 char_items = chars["characterEquipment"]["data"][char_id]["items"]
                 item_list = [i["itemHash"] for i in char_items]
                 # log.debug(item_list)
@@ -1913,7 +2337,6 @@ class Destiny(DestinyAPI, commands.Cog):
                         continue
                     name = data["displayProperties"]["name"]
                     if data["equippable"] and data["itemType"] == 3:
-
                         desc = data["displayProperties"]["description"]
                         item_type = data["itemTypeAndTierDisplayName"]
                         try:
@@ -1988,7 +2411,12 @@ class Destiny(DestinyAPI, commands.Cog):
     @commands.bot_has_permissions(
         embed_links=True,
     )
-    async def history(self, ctx: commands.Context, activity: str) -> None:
+    async def history(
+        self,
+        ctx: commands.Context,
+        activity: str,
+        character: Optional[discord.app_commands.Transform[str, DestinyCharacter]] = None,
+    ) -> None:
         """
         Display a menu of each character's last 5 activities
 
@@ -2009,7 +2437,7 @@ class Destiny(DestinyAPI, commands.Cog):
         """
         if not await self.has_oauth(ctx):
             return
-        async with ctx.typing():
+        async with MyTyping(ctx, ephemeral=False):
             if not activity.isdigit():
                 try:
                     activity = await DestinyActivity().convert(ctx, activity)
@@ -2019,6 +2447,7 @@ class Destiny(DestinyAPI, commands.Cog):
             user = ctx.author
             try:
                 chars = await self.get_characters(user)
+
             except Destiny2APIError as e:
                 # log.debug(e)
                 await self.send_error_msg(ctx, e)
@@ -2039,31 +2468,24 @@ class Destiny(DestinyAPI, commands.Cog):
             }
             embeds = []
             for char_id, char in chars["characters"]["data"].items():
+                if character and char_id != character:
+                    continue
                 # log.debug(char)
                 char_info = ""
-                race = (await self.get_definition("DestinyRaceDefinition", [char["raceHash"]]))[
-                    str(char["raceHash"])
-                ]
-                gender = (
-                    await self.get_definition("DestinyGenderDefinition", [char["genderHash"]])
-                )[str(char["genderHash"])]
-                log.debug(gender)
                 char_class = (
                     await self.get_definition("DestinyClassDefinition", [char["classHash"]])
                 )[str(char["classHash"])]
-                char_info += "{user} - {race} {gender} {char_class} ".format(
+                char_info += "{user} - {char_class} ".format(
                     user=user.display_name,
-                    race=race["displayProperties"]["name"],
-                    gender=gender["displayProperties"]["name"],
                     char_class=char_class["displayProperties"]["name"],
                 )
                 try:
                     data = await self.get_activity_history(user, char_id, activity)
                 except Exception:
                     log.error(
-                        _(
-                            "Something went wrong I couldn't get info on character {char_id} for activity {activity}"
-                        ).format(char_id=char_id, activity=activity)
+                        "Something went wrong I couldn't get info on character %s for activity %s",
+                        char_id,
+                        activity,
                     )
                     continue
                 if not data:
@@ -2087,12 +2509,9 @@ class Destiny(DestinyAPI, commands.Cog):
                         embed.set_thumbnail(
                             url=IMAGE_URL + activity_data["displayProperties"]["icon"]
                         )
-                    elif (
-                        activity_data["pgcrImage"] != "/img/misc/missing_icon_d2.png"
-                        and "emblemPath" in char
-                    ):
-                        embed.set_thumbnail(url=IMAGE_URL + char["emblemPath"])
-                    embed.set_author(name=char_info, icon_url=user.avatar.url)
+                    if activity_data.get("pgcrImage", None) is not None:
+                        embed.set_image(url=IMAGE_URL + activity_data["pgcrImage"])
+                    embed.set_author(name=char_info, icon_url=user.display_avatar)
                     for attr, name in RAID.items():
                         if activities["values"][attr]["basic"]["value"] < 0:
                             continue
@@ -2152,7 +2571,6 @@ class Destiny(DestinyAPI, commands.Cog):
     async def build_character_stats(
         self, user: discord.Member, chars: dict, stat_type: str
     ) -> List[discord.Embed]:
-
         embeds: List[discord.Embed] = []
         for char_id, char in chars["characters"]["data"].items():
             # log.debug(char)
@@ -2165,11 +2583,7 @@ class Destiny(DestinyAPI, commands.Cog):
                     agg_hashes = [a["activityHash"] for a in aggregate["activities"]]
                     acts = await self.get_definition("DestinyActivityDefinition", agg_hashes)
             except Exception:
-                log.error(
-                    _("Something went wrong I couldn't get info on character {char_id}").format(
-                        char_id=char_id
-                    )
-                )
+                log.error("Something went wrong I couldn't get info on character %s", char_id)
                 continue
             if not data:
                 continue
@@ -2185,7 +2599,9 @@ class Destiny(DestinyAPI, commands.Cog):
                     embeds.append(embed)
             except Exception:
                 log.error(
-                    f"User {user.id} had an issue generating stats for character {char_id}",
+                    "User %s had an issue generating stats for character %s",
+                    user.id,
+                    char_id,
                     exc_info=True,
                 )
                 continue
@@ -2241,7 +2657,7 @@ class Destiny(DestinyAPI, commands.Cog):
         if raid_names:
             description = "\n".join(n for n in raid_names)
             embed.description = _("__**Raids Completed:**__\n") + description
-        embed.set_author(name=f"{user.display_name} - {char_info}", icon_url=user.avatar.url)
+        embed.set_author(name=f"{user.display_name} - {char_info}", icon_url=user.display_avatar)
         kills = data[stat_type]["allTime"]["kills"]["basic"]["displayValue"]
         deaths = data[stat_type]["allTime"]["deaths"]["basic"]["displayValue"]
         assists = data[stat_type]["allTime"]["assists"]["basic"]["displayValue"]
@@ -2250,7 +2666,6 @@ class Destiny(DestinyAPI, commands.Cog):
         if "emblemPath" in char:
             embed.set_thumbnail(url=IMAGE_URL + char["emblemPath"])
         for stat, values in data[stat_type]["allTime"].items():
-
             if values["basic"]["value"] < 0 or stat not in ATTRS:
                 continue
             embed.add_field(name=ATTRS[stat], value=str(values["basic"]["displayValue"]))
@@ -2301,7 +2716,7 @@ class Destiny(DestinyAPI, commands.Cog):
             "winLossRatio": _("Win Loss Ratio"),
         }
         embed = discord.Embed(title=_("Gambit") + f" - {char_info}")
-        embed.set_author(name=f"{user.display_name} - {char_info}", icon_url=user.avatar.url)
+        embed.set_author(name=f"{user.display_name} - {char_info}", icon_url=user.display_avatar)
         kills = data["kills"]["basic"]["displayValue"]
         deaths = data["deaths"]["basic"]["displayValue"]
         assists = data["assists"]["basic"]["displayValue"]
@@ -2355,7 +2770,6 @@ class Destiny(DestinyAPI, commands.Cog):
         if "emblemPath" in char:
             embed.set_thumbnail(url=IMAGE_URL + char["emblemPath"])
         for stat, values in data.items():
-
             if values["basic"]["value"] < 0 or stat not in ATTRS:
                 continue
             embed.add_field(name=ATTRS[stat], value=str(values["basic"]["displayValue"]))
@@ -2383,10 +2797,11 @@ class Destiny(DestinyAPI, commands.Cog):
         """
         if not await self.has_oauth(ctx):
             return
-        async with ctx.typing():
+        async with MyTyping(ctx, ephemeral=False):
             user = ctx.author
             try:
                 chars = await self.get_characters(user)
+
             except Destiny2APIError as e:
                 # log.debug(e)
                 await self.send_error_msg(ctx, e)
@@ -2414,7 +2829,7 @@ class Destiny(DestinyAPI, commands.Cog):
         """
         if not await self.has_oauth(ctx):
             return
-        async with ctx.typing():
+        async with MyTyping(ctx, ephemeral=False):
             user = ctx.author
             try:
                 chars = await self.get_characters(
@@ -2442,6 +2857,18 @@ class Destiny(DestinyAPI, commands.Cog):
         various functions of the cog.
         """
         pass
+
+    @manifest.command(name="auto", with_app_command=False)
+    @commands.is_owner()
+    async def manifest_auto(self, ctx: commands.Context, auto: bool):
+        """
+        Setup the manifest to automatically download when an update is available.
+        """
+        await self.config.manifest_auto.set(auto)
+        if auto:
+            await ctx.send(_("I will automatically download manifest updates."))
+        else:
+            await ctx.send(_("I will **not** automatically download manifest updates."))
 
     @manifest.command(name="channel", with_app_command=False)
     @commands.is_owner()
@@ -2497,7 +2924,7 @@ class Destiny(DestinyAPI, commands.Cog):
         the newest one.
         """
         if not d1:
-            async with ctx.typing():
+            async with MyTyping(ctx, ephemeral=False):
                 try:
                     headers = await self.build_headers()
                 except Exception:
@@ -2526,7 +2953,7 @@ class Destiny(DestinyAPI, commands.Cog):
                 _("Would you like to {redownload} manifest?").format(redownload=redownload),
             )
             if pred:
-                async with ctx.typing():
+                async with MyTyping(ctx, ephemeral=False):
                     try:
                         version = await self.get_manifest()
                         response = _("Manifest Version {version} was downloaded.").format(

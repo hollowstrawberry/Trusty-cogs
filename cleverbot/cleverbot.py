@@ -1,14 +1,14 @@
-import logging
 from typing import Optional
 
 import discord
+from red_commons.logging import getLogger
 from redbot.core import Config, checks, commands
 from redbot.core.i18n import Translator, cog_i18n
 from redbot.core.utils.chat_formatting import humanize_list, pagify
 
 from .api import ChannelUserRole, CleverbotAPI, IntRange
 
-log = logging.getLogger("red.trusty-cogs.Cleverbot")
+log = getLogger("red.trusty-cogs.Cleverbot")
 
 _ = Translator("cleverbot", __file__)
 
@@ -22,7 +22,7 @@ class Cleverbot(CleverbotAPI, commands.Cog):
     """
 
     __author__ = ["Twentysix", "TrustyJAID"]
-    __version__ = "2.4.4"
+    __version__ = "2.4.5"
 
     def __init__(self, bot):
         self.bot = bot

@@ -1,7 +1,6 @@
 import asyncio
 import functools
 import json
-import logging
 import re
 from base64 import b64encode
 from datetime import datetime
@@ -10,6 +9,7 @@ from typing import Dict, List, Optional, Tuple, Union
 
 import aiohttp
 import discord
+from red_commons.logging import getLogger
 from redbot.core import Config, commands
 from redbot.core.bot import Red
 from redbot.core.data_manager import cog_data_path
@@ -25,6 +25,7 @@ from .converter import (
     DestinyComponentType,
     DestinyStatsGroup,
     DestinyStatsGroupType,
+    NewsArticles,
     PeriodType,
 )
 from .errors import (
@@ -67,6 +68,7 @@ COMPONENTS = DestinyComponents(
     DestinyComponentType.platform_silver,
     DestinyComponentType.characters,
     DestinyComponentType.character_inventories,
+    DestinyComponentType.character_progression,
     DestinyComponentType.character_activities,
     DestinyComponentType.character_equipment,
     DestinyComponentType.character_loadouts,
@@ -78,6 +80,7 @@ COMPONENTS = DestinyComponents(
     DestinyComponentType.item_plug_states,
     DestinyComponentType.item_plug_objectives,
     DestinyComponentType.item_reusable_plugs,
+    DestinyComponentType.kiosks,
     DestinyComponentType.currency_lookups,
     DestinyComponentType.collectibles,
     DestinyComponentType.records,
@@ -90,7 +93,15 @@ COMPONENTS = DestinyComponents(
 
 
 _ = Translator("Destiny", __file__)
-log = logging.getLogger("red.trusty-cogs.Destiny")
+log = getLogger("red.trusty-cogs.Destiny")
+
+
+class MyTyping(discord.ext.commands.context.DeferTyping):
+    async def __aenter__(self):
+        if self.ctx.interaction and not self.ctx.interaction.response.is_done():
+            await self.ctx.defer(ephemeral=self.ephemeral)
+        else:
+            await self.ctx.typing()
 
 
 @cog_i18n(_)
@@ -101,6 +112,26 @@ class DestinyAPI:
     dashboard_authed: Dict[int, dict]
     session: aiohttp.ClientSession
     _manifest: dict
+    _ready: asyncio.Event
+
+    async def load_cache(self):
+        if await self.config.cache_manifest() > 1:
+            self._ready.set()
+            return
+        loop = asyncio.get_running_loop()
+        for file in cog_data_path(self).iterdir():
+            if not file.is_file():
+                continue
+            task = functools.partial(self.load_file, file=file)
+            name = file.name.replace(".json", "")
+            try:
+                self._manifest[name] = await asyncio.wait_for(
+                    loop.run_in_executor(None, task), timeout=60
+                )
+            except asyncio.TimeoutError:
+                log.info("Error loading manifest data")
+                continue
+        self._ready.set()
 
     async def request_url(
         self, url: str, params: Optional[dict] = None, headers: Optional[dict] = None
@@ -123,10 +154,10 @@ class DestinyAPI:
                     return data["Response"]
                 else:
                     if "message" in data:
-                        log.error(data["message"])
+                        log.error("DestinyAPI request_url error message: %s", data["message"])
                     else:
                         log.error("Incorrect response data")
-                    log.debug(url)
+                    log.verbose("request_url: %s", url)
                     raise Destiny2InvalidParameters(data)
             elif resp.status >= 500:
                 raise ServersUnavailable
@@ -160,7 +191,7 @@ class DestinyAPI:
                     return data["Response"]
                 else:
                     if "message" in data:
-                        log.error(data["message"])
+                        log.error("DestinyAPI post_url error message: %s", data["message"])
                     else:
                         log.error("Incorrect response data")
                     raise Destiny2InvalidParameters(data["Message"])
@@ -267,7 +298,10 @@ class DestinyAPI:
         code = None
 
         def check(message):
-            return (author.id in self.dashboard_authed) or message.author.id == author.id
+            return (author.id in self.dashboard_authed) or (
+                message.author.id == author.id
+                and re.search(r"\?code=([a-z0-9]+)|(exit|stop)", message.content, flags=re.I)
+            )
 
         try:
             wait_msg = await self.bot.wait_for("message", check=check, timeout=180)
@@ -283,7 +317,7 @@ class DestinyAPI:
             else:
                 code = wait_msg.content
 
-        if code != "exit":
+        if code not in ["exit", "stop"]:
             return code
         return None
 
@@ -406,25 +440,33 @@ class DestinyAPI:
         return await self.request_url(url, params=params, headers=headers)
 
     async def replace_string(
-        self, user: discord.abc.User, text: str, character: Optional[int] = None
+        self,
+        user: discord.abc.User,
+        text: str,
+        character: Optional[int] = None,
+        variables: Optional[dict] = None,
     ) -> str:
         """
         This replaces string variables in a givent text if it exists
         """
         if not STRING_VAR_RE.search(text):
             return text
-        all_variables = await self.get_variables(user)
+        if variables is None:
+            variables = await self.get_variables(user)
+
         if character is not None:
-            variables = all_variables["characterStringVariables"]["data"][str(character)][
+            all_variables = variables["characterStringVariables"]["data"][str(character)][
                 "integerValuesByHash"
             ]
         else:
-            variables = all_variables["profileStringVariables"]["data"]["integerValuesByHash"]
+            all_variables = variables["profileStringVariables"]["data"]["integerValuesByHash"]
         for var in STRING_VAR_RE.finditer(text):
             try:
-                text = STRING_VAR_RE.sub(str(variables[str(var.group("hash"))]), text)
+                repl = str(all_variables[str(var.group("hash"))])
             except KeyError:
                 log.error("Could not find variable %s", var.group("hash"))
+                continue
+            text = text.replace(var.group(0), repl)
 
         return text
 
@@ -442,11 +484,22 @@ class DestinyAPI:
         if components is None:
             components = COMPONENTS
 
+        components.add(DestinyComponentType.characters)
+        components.add(DestinyComponentType.profiles)
         params = components.to_dict()
         platform = await self.config.user(user).account.membershipType()
         user_id = await self.config.user(user).account.membershipId()
         url = BASE_URL + f"/Destiny2/{platform}/Profile/{user_id}/"
-        return await self.request_url(url, params=params, headers=headers)
+        try:
+            chars = await self.request_url(url, params=params, headers=headers)
+        except Exception:
+            raise
+        if "characters" in chars:
+            # Save this data every time we call this endpoint to ensure accuracy with autocomplete
+            # This is mainly a nice thing to have to sort player characters based on
+            # the last played character
+            await self.config.user(user).characters.set(chars["characters"]["data"])
+        return chars
 
     async def get_character(
         self,
@@ -509,28 +562,6 @@ class DestinyAPI:
             data = json.load(f)
         return data
 
-    async def cog_load(self):
-        if self.bot.user.id in DEV_BOTS:
-            try:
-                self.bot.add_dev_env_value("destiny", lambda x: self)
-            except Exception:
-                pass
-        if await self.config.cache_manifest() <= 1:
-            return
-        loop = asyncio.get_running_loop()
-        for file in cog_data_path(self).iterdir():
-            if not file.is_file():
-                continue
-            task = functools.partial(self.load_file, file=file)
-            name = file.name.replace(".json", "")
-            try:
-                self._manifest[name] = await asyncio.wait_for(
-                    loop.run_in_executor(None, task), timeout=60
-                )
-            except asyncio.TimeoutError:
-                log.info("Error loading manifest data")
-                continue
-
     async def get_entities(self, entity: str, d1: bool = False) -> dict:
         """This returns the full entity data asynchronously
 
@@ -554,7 +585,7 @@ class DestinyAPI:
         try:
             data = await self.get_entities(entity, d1)
         except Exception:
-            log.info(_("No manifest found, getting response from API."))
+            log.info("No manifest found, getting response from API.")
             return await self.get_definition_from_api(entity.replace("Lite", ""), entity_hash)
         for item in entity_hash:
             try:
@@ -608,7 +639,13 @@ class DestinyAPI:
                     items[str(data["hash"])] = data
         return items
 
-    async def get_vendor(self, user: discord.abc.User, character: str, vendor: str) -> dict:
+    async def get_vendor(
+        self,
+        user: discord.abc.User,
+        character: str,
+        vendor: str,
+        components: Optional[DestinyComponents] = None,
+    ) -> dict:
         """
         This gets the inventory of a specified Vendor
         """
@@ -616,19 +653,46 @@ class DestinyAPI:
             headers = await self.build_headers(user)
         except Exception:
             raise Destiny2RefreshTokenError
-        components = DestinyComponents(
-            DestinyComponentType.item_stats,
-            DestinyComponentType.item_sockets,
-            DestinyComponentType.item_plug_states,
-            DestinyComponentType.item_reusable_plugs,
-            DestinyComponentType.vendors,
-            DestinyComponentType.vendor_categories,
-            DestinyComponentType.vendor_sales,
-        )
+        if components is None:
+            components = DestinyComponents(
+                DestinyComponentType.item_stats,
+                DestinyComponentType.item_sockets,
+                DestinyComponentType.item_plug_states,
+                DestinyComponentType.item_reusable_plugs,
+                DestinyComponentType.vendors,
+                DestinyComponentType.vendor_categories,
+                DestinyComponentType.vendor_sales,
+            )
         params = components.to_dict()
         platform = await self.config.user(user).account.membershipType()
         user_id = await self.config.user(user).account.membershipId()
         url = f"{BASE_URL}/Destiny2/{platform}/Profile/{user_id}/Character/{character}/Vendors/{vendor}/"
+        return await self.request_url(url, params=params, headers=headers)
+
+    async def get_vendors(
+        self,
+        user: discord.abc.User,
+        character: str,
+        components: Optional[DestinyComponents] = None,
+    ) -> dict:
+        try:
+            headers = await self.build_headers(user)
+        except Exception:
+            raise Destiny2RefreshTokenError
+        if components is None:
+            components = DestinyComponents(
+                DestinyComponentType.item_stats,
+                DestinyComponentType.item_sockets,
+                DestinyComponentType.item_plug_states,
+                DestinyComponentType.item_reusable_plugs,
+                DestinyComponentType.vendors,
+                DestinyComponentType.vendor_categories,
+                DestinyComponentType.vendor_sales,
+            )
+        params = components.to_dict()
+        platform = await self.config.user(user).account.membershipType()
+        user_id = await self.config.user(user).account.membershipId()
+        url = f"{BASE_URL}/Destiny2/{platform}/Profile/{user_id}/Character/{character}/Vendors/"
         return await self.request_url(url, params=params, headers=headers)
 
     async def get_clan_members(self, user: discord.abc.User, clan_id: str) -> dict:
@@ -776,19 +840,20 @@ class DestinyAPI:
         url = f"{BASE_URL}/Destiny2/Stats/PostGameCarnageReport/{activity_id}/"
         return await self.request_url(url, headers=headers)
 
-    async def get_news(self, page_number: int = 0) -> dict:
+    async def get_news(self, page_number: int = 0) -> NewsArticles:
         try:
             headers = await self.build_headers()
         except Exception:
             raise Destiny2RefreshTokenError
         url = f"{BASE_URL}/Content/Rss/NewsArticles/{page_number}"
-        return await self.request_url(url, headers=headers)
+        data = NewsArticles.from_json(await self.request_url(url, headers=headers))
+        return data
 
     async def get_activity_history(
         self,
         user: discord.abc.User,
         character: str,
-        mode: Union[DestinyActivityModeType, int],
+        mode: Optional[Union[DestinyActivityModeType, int]] = None,
         groups: Optional[DestinyStatsGroup] = None,
     ) -> dict:
         """
@@ -803,7 +868,11 @@ class DestinyAPI:
             groups = DestinyStatsGroup.all()
         if isinstance(mode, int):
             mode = DestinyActivityModeType(mode)
-        params = {"count": 5, "mode": mode.value, "groups": groups.to_str()}
+        mode_value = None
+        if mode:
+            mode_value = mode.value
+
+        params = {"count": 5, "mode": mode_value, "groups": groups.to_str()}
         platform = await self.config.user(user).account.membershipType()
         user_id = await self.config.user(user).account.membershipId()
         url = f"{BASE_URL}/Destiny2/{platform}/Account/{user_id}/Character/{character}/Stats/Activities/"
@@ -912,7 +981,6 @@ class DestinyAPI:
         Basic checks to see if the user has OAuth setup
         if not or the OAuth keys are expired this will call the refresh
         """
-        is_slash = ctx.interaction is not None
         author = ctx.author
         error_msg = _(
             "You need to authenticate your Bungie.net account before this command will work."
@@ -946,10 +1014,7 @@ class DestinyAPI:
                     await author.send(str(e))
                 except discord.errors.Forbidden:
                     await ctx.channel.send(str(e))
-                if is_slash:
-                    await ctx.followup.send(error_msg)
-                else:
-                    await ctx.send(error_msg)
+                await ctx.send(error_msg)
                 return False
             except Destiny2MissingAPITokens:
                 # await ctx.send(str(e))
@@ -957,20 +1022,13 @@ class DestinyAPI:
             data["expires_at"] = now + data["expires_in"]
             data["refresh_expires_at"] = now + data["refresh_expires_in"]
             await self.config.user(author).oauth.set(data)
-            try:
-                await author.send(_("Credentials saved."))
-            except discord.errors.Forbidden:
-                await ctx.channel.send(_("Credentials saved."))
         if not await self.config.user(author).account():
             data = await self.get_user_profile(author)
             platform = ""
             if len(data["destinyMemberships"]) > 1:
                 datas, platform = await self.pick_account(ctx, data)
                 if not datas:
-                    if is_slash:
-                        await ctx.followup.send(error_msg)
-                    else:
-                        await ctx.send(error_msg)
+                    await ctx.send(error_msg)
                     return False
                 await self.config.user(author).account.set(datas)
             else:
@@ -1019,7 +1077,7 @@ class DestinyAPI:
             message = await ctx.channel.send(msg)
 
         emojis = ReactionPredicate.NUMBER_EMOJIS[1 : -(len(profile["destinyMemberships"]) + 1)]
-        log.debug(emojis)
+        log.verbose("pick_account emojis: %s", emojis)
         start_adding_reactions(message, emojis)
         pred = ReactionPredicate.with_emojis(emojis=emojis, message=message, user=author)
         try:

@@ -1,14 +1,15 @@
 import json
-import logging
 from datetime import date, datetime, timedelta, timezone
+from typing import Optional
 
 import discord
+from red_commons.logging import getLogger
 from redbot.core import commands
 from redbot.core.i18n import Translator
 from redbot.core.utils import AsyncIter
 from redbot.core.utils.chat_formatting import pagify
 
-from .abc import MixinMeta
+from .abc import HockeyMixin
 from .constants import TEAMS
 from .errors import InvalidFileError
 from .game import Game
@@ -27,10 +28,10 @@ except ImportError:
 
 _ = Translator("Hockey", __file__)
 
-log = logging.getLogger("red.trusty-cogs.hockey")
+log = getLogger("red.trusty-cogs.hockey")
 
 
-class HockeyDev(MixinMeta):
+class HockeyDev(HockeyMixin):
     """
     All the commands grouped under `[p]hockeydev`
     """
@@ -99,7 +100,7 @@ class HockeyDev(MixinMeta):
         # log.debug(link)
         with open("/mnt/e/github/Trusty-cogs/hockey/testgame.json", "r") as infile:
             data = json.loads(infile.read())
-        # log.debug(data)
+        log.verbose("getgoals testgame.json data: %s", data)
         game = await Game.from_json(data)
         await game.check_game_state(self.bot)
         if (game.home_score + game.away_score) != 0:
@@ -138,6 +139,18 @@ class HockeyDev(MixinMeta):
 
         await ctx.send(msg)
 
+    @pickems_dev_commands.command(name="msg")
+    async def pickems_dev_msg(self, ctx: commands.Context, *, msg: Optional[str] = None):
+        """
+        Set the message sent to users attempting to add pickems when it
+        is disabled.
+        """
+        if msg and len(msg) > 2000:
+            await ctx.send(_("Your message needs to be fewer than 2000 characters."))
+            return
+        await self.pickems_config.unavailable_msg.set(msg)
+        await ctx.send(_("Pickems Unavailable message set to:\n{msg}").format(msg=msg))
+
     @pickems_dev_commands.command(name="addguild")
     async def pickems_add_guild(self, ctx: commands.Context, guild_id: int):
         """
@@ -160,6 +173,8 @@ class HockeyDev(MixinMeta):
         async with self.pickems_config.allowed_guilds() as allowed:
             if guild_id in allowed:
                 allowed.remove(guild_id)
+        await self.pickems_config.guild_from_id(guild_id).pickems_channel.clear()
+        await self.pickems_config.guild_from_id(guild_id).pickems_category.clear()
         await ctx.send(
             _("Guild {guild_id} removed from the pickems allowed guilds.").format(
                 guild_id=guild_id
@@ -205,7 +220,7 @@ class HockeyDev(MixinMeta):
         # log.debug(link)
         with open("/mnt/e/github/Trusty-cogs/hockey/testgame.json", "r") as infile:
             data = json.loads(infile.read())
-        # log.debug(data)
+        log.verbose("make_fake_pickems - testgame.json: %s", data)
         game = await Game.from_json(data)
         fake_pickem = await self.get_pickem_object(ctx.guild, game)
         msg = await self.make_pickems_msg(ctx.guild, game)
@@ -220,7 +235,7 @@ class HockeyDev(MixinMeta):
         """
         with open("/mnt/e/github/Trusty-cogs/hockey/testgame.json", "r") as infile:
             data = json.loads(infile.read())
-        # log.debug(data)
+        log.verbose("disable_fake_pickems - testgame.json: %s", data)
         game = await Game.from_json(data)
         await self.disable_pickems_buttons(game)
 
@@ -231,7 +246,7 @@ class HockeyDev(MixinMeta):
         """
         with open("/mnt/e/github/Trusty-cogs/hockey/testgame.json", "r") as infile:
             data = json.loads(infile.read())
-        # log.debug(data)
+        log.verbose("finalize_fake_pickems - testgame.json: %s", data)
         game = await Game.from_json(data)
         await self.set_guild_pickem_winner(game)
 
@@ -500,11 +515,12 @@ class HockeyDev(MixinMeta):
         """
         guild = ctx.message.guild
         good_channels = []
-        for channel_id in await self.config.guild(guild).gdc():
+        gdc_chans = await self.config.guild(guild).gdc_chans()
+        for channel_id in gdc_chans.values():
             channel = guild.get_channel(channel_id)
             if channel is None:
                 await self.config.channel_from_id(channel_id).clear()
-                log.info(f"Removed the following channels {channel_id}")
+                log.info("Removed the following channels %s", channel_id)
                 continue
             else:
                 good_channels.append(channel.id)
@@ -527,13 +543,13 @@ class HockeyDev(MixinMeta):
                 if not guild:
                     await self.config.channel_from_id(channel_id).clear()
                     await self.config.guild_from_id(int(data["guild_id"])).clear()
-                    log.info(f"Removed the following channels {channel_id}")
+                    log.info("Removed the following channels %s", channel_id)
                     continue
                 channel = guild.get_channel
 
             if channel is None:
                 await self.config.channel_from_id(channel_id).clear()
-                log.info(f"Removed the following channels {channel_id}")
+                log.info("Removed the following channels %s", channel_id)
                 continue
             # if await self.config.channel(channel).to_delete():
             # await self.config._clear_scope(Config.CHANNEL, str(channels))

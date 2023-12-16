@@ -1,7 +1,8 @@
-import logging
 from typing import Union
 
+import discord
 from discord import Interaction
+from red_commons.logging import getLogger
 from redbot.core import commands
 from redbot.core.commands import Context
 from redbot.core.i18n import Translator
@@ -12,7 +13,7 @@ from .converter import RoleHierarchyConverter
 
 roletools = RoleToolsMixin.roletools
 
-log = logging.getLogger("red.Trusty-cogs.RoleTools")
+log = getLogger("red.Trusty-cogs.RoleTools")
 _ = Translator("RoleTools", __file__)
 
 
@@ -54,7 +55,7 @@ class RoleToolsRequires(RoleToolsMixin):
         self,
         ctx: Union[Context, Interaction],
         role: RoleHierarchyConverter,
-        required: commands.Greedy[RoleHierarchyConverter],
+        required: commands.Greedy[discord.Role],
     ) -> None:
         """
         Add role requirements
@@ -86,7 +87,7 @@ class RoleToolsRequires(RoleToolsMixin):
         self,
         ctx: Union[Context, Interaction],
         role: RoleHierarchyConverter,
-        required: commands.Greedy[RoleHierarchyConverter],
+        required: commands.Greedy[discord.Role],
     ) -> None:
         """
         Remove role requirements

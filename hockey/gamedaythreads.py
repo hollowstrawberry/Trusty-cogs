@@ -1,24 +1,25 @@
-import logging
 from datetime import datetime
 from typing import Optional
 
+import aiohttp
 import discord
+from red_commons.logging import getLogger
 from redbot.core import commands
 from redbot.core.i18n import Translator
 from redbot.core.utils.chat_formatting import humanize_list
 
-from .abc import MixinMeta
+from .abc import HockeyMixin
 from .game import Game
 from .helper import StateFinder, TeamFinder, get_chn_name
 
-log = logging.getLogger("red.trusty-cogs.Hockey")
+log = getLogger("red.trusty-cogs.Hockey")
 
 _ = Translator("Hockey", __file__)
 
-hockey_commands = MixinMeta.hockey_commands
+hockey_commands = HockeyMixin.hockey_commands
 
 
-class GameDayThreads(MixinMeta):
+class GameDayThreads(HockeyMixin):
     """
     All the commands grouped under `[p]gdc`
     """
@@ -54,7 +55,7 @@ class GameDayThreads(MixinMeta):
         team = await self.config.guild(guild).gdt_team()
         if team is None:
             team = "None"
-        threads = await self.config.guild(guild).gdt()
+        threads = (await self.config.guild(guild).gdt_chans()).values()
         channel = guild.get_channel(await self.config.guild(guild).gdt_channel())
         game_states = await self.config.guild(guild).gdt_state_updates()
         if channel is not None:
@@ -163,7 +164,14 @@ class GameDayThreads(MixinMeta):
             msg = _("No team was setup for game day threads in this server.")
             await ctx.send(msg)
         if await self.config.guild(ctx.guild).create_threads():
-            await self.create_gdt(ctx.guild)
+            try:
+                await self.create_gdt(ctx.guild)
+            except aiohttp.ClientConnectorError:
+                await ctx.send(
+                    _("There's an issue accessing the NHL API at the moment. Try again later.")
+                )
+                log.exception("Error accessing NHL API")
+                return
         else:
             msg = _("You need to first toggle thread creation with `{prefix}gdt toggle`.").format(
                 prefix=ctx.clean_prefix
@@ -183,8 +191,8 @@ class GameDayThreads(MixinMeta):
         if await self.config.guild(guild).create_channels():
             msg = _(
                 "You cannot have both game day channels and game day threads in the same server. "
-                "Use `{prefix}gdc toggle` first to disable game day channels then try again."
-            ).format(prefix=ctx.clean_prefix)
+                "Use `{prefix}{command}` first to disable game day channels then try again."
+            ).format(prefix=ctx.clean_prefix, command=self.gdc_toggle.qualified_name)
             await ctx.send(msg)
             return
         cur_setting = not await self.config.guild(guild).create_threads()
@@ -236,8 +244,8 @@ class GameDayThreads(MixinMeta):
         if await self.config.guild(guild).create_channels():
             msg = _(
                 "You cannot have both game day channels and game day threads in the same server. "
-                "Use `{prefix}gdc toggle` first to disable game day channels then try again."
-            ).format(prefix=ctx.clean_prefix)
+                "Use `{prefix}{command}` first to disable game day channels then try again."
+            ).format(prefix=ctx.clean_prefix, command=self.gdc_toggle.qualified_name)
             await ctx.send(msg)
             return
         if team is None:
@@ -254,9 +262,23 @@ class GameDayThreads(MixinMeta):
         await self.config.guild(guild).gdt_team.set(team)
         await self.config.guild(guild).create_threads.set(True)
         if team.lower() != "all":
-            await self.create_gdt(guild)
+            try:
+                await self.create_gdt(guild)
+            except aiohttp.ClientConnectorError:
+                await ctx.send(
+                    _("There's an issue accessing the NHL API at the moment. Try again later.")
+                )
+                log.exception("Error accessing NHL API")
+                return
         else:
-            game_list = await Game.get_games(session=self.session)
+            try:
+                game_list = await self.api.get_games()
+            except aiohttp.ClientConnectorError:
+                await ctx.send(
+                    _("There's an issue accessing the NHL API at the moment. Try again later.")
+                )
+                log.exception("Error accessing NHL API")
+                return
             for game in game_list:
                 if game.game_state == "Postponed":
                     continue
@@ -271,9 +293,7 @@ class GameDayThreads(MixinMeta):
     #######################################################################
 
     async def check_new_gdt(self) -> None:
-        game_list = await Game.get_games(
-            session=self.session
-        )  # Do this once so we don't spam the api
+        game_list = await self.api.get_games()  # Do this once so we don't spam the api
         for guilds in await self.config.all_guilds():
             guild = self.bot.get_guild(guilds)
             if guild is None:
@@ -284,36 +304,28 @@ class GameDayThreads(MixinMeta):
                 continue
             team = await self.config.guild(guild).gdt_team()
             if team != "all":
-                next_games = await Game.get_games_list(team, datetime.now(), session=self.session)
+                next_games = await self.api.get_games(team, datetime.now())
                 next_game = None
                 if next_games != []:
-                    next_game = await Game.from_url(next_games[0]["link"], session=self.session)
+                    next_game = next_games[0]
                 if next_game is None:
                     continue
-                chn_name = get_chn_name(next_game)
-                try:
-                    cur_channels = await self.config.guild(guild).gdt()
-                    if cur_channels:
-                        cur_channel = guild.get_thread(cur_channels[0])
-                        if not cur_channel:
-                            try:
-                                cur_channel = await guild.fetch_channel(cur_channels[0])
-                            except Exception:
-                                cur_channel = None
-                                await self.config.guild(guild).gdt.clear()
-                                # clear the config data so that this always contains at most
-                                # 1 game day thread when only one team is specified
-                                # fetch_channel is used as a backup incase the thread
-                                # becomes archived and bot restarts and needs its refernce
-                    else:
-                        cur_channel = None
-                        # this is dumb but eh
-                except Exception:
-                    log.error("Error checking new GDT", exc_info=True)
-                    cur_channel = None
+                cur_channel = None
+                cur_channels = await self.config.guild(guild).gdt_chans()
+                if cur_channels and str(next_game.game_id) in cur_channels:
+                    chan_id = cur_channels[str(next_game.game_id)]
+                    cur_channel = guild.get_thread(chan_id)
+                    if not cur_channel:
+                        try:
+                            cur_channel = await guild.fetch_channel(chan_id)
+                        except Exception:
+                            cur_channel = None
+                            await self.config.guild(guild).gdt_chans.clear()
+                            # clear the config data so that this always contains at most
+                            # 1 game day thread when only one team is specified
+                            # fetch_channel is used as a backup incase the thread
+                            # becomes archived and bot restarts and needs its reference
                 if cur_channel is None:
-                    await self.create_gdt(guild)
-                elif cur_channel.name != chn_name.lower():
                     await self.delete_gdt(guild)
                     await self.create_gdt(guild)
 
@@ -342,9 +354,7 @@ class GameDayThreads(MixinMeta):
         if guild.me.is_timed_out():
             return
         if not channel.permissions_for(guild.me).create_public_threads:
-            log.info(
-                f"Cannot create new GDT in {repr(guild)} due to too many missing permissions."
-            )
+            log.info("Cannot create new GDT in %r due to too many missing permissions.", guild)
             return
         # if len(category.channels) >= 50:
         #     log.info(
@@ -355,9 +365,9 @@ class GameDayThreads(MixinMeta):
         if game_data is None:
             team = await self.config.guild(guild).gdt_team()
 
-            next_games = await Game.get_games_list(team, datetime.now(), session=self.session)
+            next_games = await self.api.get_games_list(team, datetime.now())
             if next_games != []:
-                next_game = await Game.from_url(next_games[0]["link"], session=self.session)
+                next_game = next_games[0]
                 if next_game is None:
                     return
             else:
@@ -394,13 +404,14 @@ class GameDayThreads(MixinMeta):
         try:
             new_chn = await channel.create_thread(name=chn_name, message=preview_msg)
         except discord.Forbidden:
-            log.error(f"Error creating channel in {repr(guild)}")
+            log.error("Error creating channel in %r", guild)
             return
         except Exception:
-            log.exception(f"Error creating channels in {repr(guild)}")
+            log.exception("Error creating channels in %r", guild)
             return
-        async with self.config.guild(guild).gdt() as current_gdc:
-            current_gdc.append(new_chn.id)
+        async with self.config.guild(guild).gdt_chans() as current_gdt:
+            current_gdt[str(next_game.game_id)] = new_chn.id
+        # current_gdc.append(new_chn.id)
         # await config.guild(guild).create_channels.set(True)
         update_gdt = await self.config.guild(guild).update_gdt()
         await self.config.channel(new_chn).team.set([team])
@@ -419,16 +430,7 @@ class GameDayThreads(MixinMeta):
         since it's no longer necessary to keep and threads will be automatically
         archived
         """
-        channels = await self.config.guild(guild).gdt()
-        if channels is None:
-            channels = []
-        for channel in channels:
-            chn = guild.get_thread(channel)
-            if chn is None:
-                await self.config.channel_from_id(channel).clear()
-                continue
-            try:
-                await self.config.channel(chn).clear()
-            except Exception:
-                log.exception(f"Cannot delete GDT threads in {guild.id}")
-        await self.config.guild(guild).gdt.clear()
+        channels = await self.config.guild(guild).gdt_chans()
+        for channel in channels.values():
+            await self.config.channel_from_id(channel).clear()
+        await self.config.guild(guild).gdt_chans.clear()

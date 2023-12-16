@@ -1,24 +1,25 @@
-import logging
 from datetime import datetime
 from typing import Optional
 
+import aiohttp
 import discord
+from red_commons.logging import getLogger
 from redbot.core import commands
 from redbot.core.i18n import Translator
 from redbot.core.utils.chat_formatting import humanize_list
 
-from .abc import MixinMeta
+from .abc import HockeyMixin
 from .game import Game
 from .helper import StateFinder, TeamFinder, get_chn_name
 
-log = logging.getLogger("red.trusty-cogs.Hockey")
+log = getLogger("red.trusty-cogs.Hockey")
 
 _ = Translator("Hockey", __file__)
 
-hockey_commands = MixinMeta.hockey_commands
+hockey_commands = HockeyMixin.hockey_commands
 
 
-class GameDayChannels(MixinMeta):
+class GameDayChannels(HockeyMixin):
     """
     All the commands grouped under `[p]gdc`
     """
@@ -52,7 +53,7 @@ class GameDayChannels(MixinMeta):
             team = await self.config.guild(guild).gdc_team()
             if team is None:
                 team = "None"
-            channels = await self.config.guild(guild).gdc()
+            channels = (await self.config.guild(guild).gdc_chans()).values()
             category = guild.get_channel(await self.config.guild(guild).category())
             delete_gdc = await self.config.guild(guild).delete_gdc()
             game_states = await self.config.guild(guild).gdc_state_updates()
@@ -141,7 +142,14 @@ class GameDayChannels(MixinMeta):
             await ctx.send(_("No team was setup for game day channels in this server."))
             return
         if await self.config.guild(ctx.guild).create_channels():
-            await self.create_gdc(ctx.guild)
+            try:
+                await self.create_gdc(ctx.guild)
+            except aiohttp.ClientConnectorError:
+                await ctx.send(
+                    _("There's an issue accessing the NHL API at the moment. Try again later.")
+                )
+                log.exception("Error accessing NHL API")
+                return
         else:
             await ctx.send(
                 _("You need to first toggle channel creation with `{prefix}gdc toggle`.").format(
@@ -161,8 +169,8 @@ class GameDayChannels(MixinMeta):
             await ctx.send(
                 _(
                     "You cannot have both game day channels and game day threads in the same server. "
-                    "Use `{prefix}gdt toggle` first to disable game day channels then try again."
-                ).format(prefix=ctx.clean_prefix)
+                    "Use `{prefix}{command}` first to disable game day threads then try again."
+                ).format(prefix=ctx.clean_prefix, command=self.gdt_toggle.qualified_name)
             )
             return
         cur_setting = not await self.config.guild(guild).create_channels()
@@ -236,8 +244,8 @@ class GameDayChannels(MixinMeta):
             await ctx.send(
                 _(
                     "You cannot have both game day channels and game day threads in the same server. "
-                    "Use `{prefix}gdt toggle` first to disable game day channels then try again."
-                ).format(prefix=ctx.clean_prefix)
+                    "Use `{prefix}{command}` first to disable game day threads then try again."
+                ).format(prefix=ctx.clean_prefix, command=self.gdt_toggle.qualified_name)
             )
             return
         if team is None:
@@ -245,7 +253,7 @@ class GameDayChannels(MixinMeta):
             return
         if category is None and ctx.channel.category is not None:
             category = guild.get_channel(ctx.channel.category_id)
-        else:
+        if category is None:
             await ctx.send(
                 _("You must specify a channel category for game day channels to be created under.")
             )
@@ -258,11 +266,25 @@ class GameDayChannels(MixinMeta):
         await self.config.guild(guild).delete_gdc.set(delete_gdc)
         await self.config.guild(guild).create_channels.set(True)
         if team.lower() != "all":
-            await self.create_gdc(guild)
+            try:
+                await self.create_gdc(guild)
+            except aiohttp.ClientConnectorError:
+                await ctx.send(
+                    _("There's an issue accessing the NHL API at the moment. Try again later.")
+                )
+                log.exception("Error accessing NHL API")
+                return
         else:
-            game_list = await Game.get_games(session=self.session)
+            game_list = await self.api.get_games()
             for game in game_list:
-                await self.create_gdc(guild, game)
+                try:
+                    await self.create_gdc(guild, game)
+                except aiohttp.ClientConnectorError:
+                    await ctx.send(
+                        _("There's an issue accessing the NHL API at the moment. Try again later.")
+                    )
+                    log.exception("Error accessing NHL API")
+                    return
         await ctx.send(_("Game Day Channels for ") + team + _(" setup in ") + category.name)
 
     #######################################################################
@@ -270,9 +292,7 @@ class GameDayChannels(MixinMeta):
     #######################################################################
 
     async def check_new_gdc(self) -> None:
-        game_list = await Game.get_games(
-            session=self.session
-        )  # Do this once so we don't spam the api
+        game_list = await self.api.get_games()  # Do this once so we don't spam the api
         for guilds in await self.config.all_guilds():
             guild = self.bot.get_guild(guilds)
             if guild is None:
@@ -283,32 +303,23 @@ class GameDayChannels(MixinMeta):
                 continue
             team = await self.config.guild(guild).gdc_team()
             if team != "all":
-                next_games = await Game.get_games_list(team, datetime.now(), session=self.session)
+                next_games = await self.api.get_games(team, datetime.now())
                 next_game = None
                 if next_games != []:
-                    next_game = await Game.from_url(next_games[0]["link"], session=self.session)
+                    next_game = next_games[0]
                 if next_game is None:
                     continue
-                chn_name = get_chn_name(next_game)
-                try:
-                    cur_channels = await self.config.guild(guild).gdc()
-                    if cur_channels:
-                        cur_channel = guild.get_channel(cur_channels[0])
-                    else:
-                        cur_channel = None
-                        # this is dumb but eh
-                except Exception:
-                    log.error("Error checking new GDC", exc_info=True)
-                    cur_channel = None
+                cur_channels = await self.config.guild(guild).gdc_chans()
+                cur_channel = guild.get_channel(cur_channels.get(str(next_game.game_id)))
                 if cur_channel is None:
-                    await self.create_gdc(guild)
-                elif cur_channel.name != chn_name.lower():
                     await self.delete_gdc(guild)
                     await self.create_gdc(guild)
 
             else:
                 await self.delete_gdc(guild)
                 for game in game_list:
+                    if game.game_state == "Postponed":
+                        continue
                     await self.create_gdc(guild, game)
 
     async def create_gdc(self, guild: discord.Guild, game_data: Optional[Game] = None) -> None:
@@ -325,21 +336,17 @@ class GameDayChannels(MixinMeta):
             # Return none if there's no category to create the channel
             return
         if not category.permissions_for(guild.me).manage_channels:
-            log.info(
-                f"Cannot create new GDC in {repr(guild)} due to too many missing permissions."
-            )
+            log.info("Cannot create new GDC in %r due to too many missing permissions.", guild)
             return
         if len(category.channels) >= 50:
-            log.info(
-                f"Cannot create new GDC in {repr(guild)} due to too many channels in category."
-            )
+            log.info("Cannot create new GDC in %r due to too many channels in category.", guild)
             return
         if game_data is None:
             team = await self.config.guild(guild).gdc_team()
 
-            next_games = await Game.get_games_list(team, datetime.now(), session=self.session)
+            next_games = await self.api.get_games(team, datetime.now())
             if next_games != []:
-                next_game = await Game.from_url(next_games[0]["link"], session=self.session)
+                next_game = next_games[0]
                 if next_game is None:
                     return
             else:
@@ -353,12 +360,12 @@ class GameDayChannels(MixinMeta):
         try:
             new_chn = await guild.create_text_channel(chn_name, category=category)
         except discord.Forbidden:
-            log.error(f"Error creating channel in {repr(guild)}")
+            log.error("Error creating channel in %r", guild)
         except Exception:
             log.exception(f"Error creating channels in {repr(guild)}")
             return
-        async with self.config.guild(guild).gdc() as current_gdc:
-            current_gdc.append(new_chn.id)
+        async with self.config.guild(guild).gdc_chans() as current_gdc:
+            current_gdc[str(next_game.game_id)] = new_chn.id
         # await config.guild(guild).create_channels.set(True)
         await self.config.channel(new_chn).team.set([team])
         await self.config.channel(new_chn).guild_id.set(guild.id)
@@ -399,21 +406,20 @@ class GameDayChannels(MixinMeta):
         """
         Deletes all game day channels in a given guild
         """
-        channels = await self.config.guild(guild).gdc()
+        channels = await self.config.guild(guild).gdc_chans()
         if channels is None:
-            channels = []
-        for channel in channels:
-            chn = guild.get_channel(channel)
-            if chn is None:
-                await self.config.channel_from_id(channel).clear()
-                continue
-            if not await self.config.channel(chn).to_delete():
-                continue
-            try:
-                await self.config.channel(chn).clear()
-                await chn.delete()
-            except discord.errors.Forbidden:
-                log.error(f"Cannot delete GDC channels in {guild.id} due to permissions issue.")
-            except Exception:
-                log.exception(f"Cannot delete GDC channels in {guild.id}")
-        await self.config.guild(guild).gdc.clear()
+            channels = {}
+        for channel in channels.values():
+            if await self.config.channel_from_id(channel).to_delete():
+                chn = guild.get_channel(channel)
+                if chn is not None:
+                    try:
+                        await chn.delete()
+                    except discord.errors.Forbidden:
+                        log.error(
+                            "Cannot delete GDC channels in %s due to permissions issue.", guild.id
+                        )
+                    except Exception:
+                        log.exception(f"Cannot delete GDC channels in {guild.id}")
+            await self.config.channel_from_id(channel).clear()
+        await self.config.guild(guild).gdc_chans.clear()

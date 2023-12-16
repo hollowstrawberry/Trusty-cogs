@@ -1,22 +1,23 @@
 from __future__ import annotations
 
 import json
-import logging
 from collections import deque
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime
 from enum import Enum
 from typing import List, NamedTuple, Optional, Tuple, Union
 
 import aiohttp
 import discord
 import pytz
+from red_commons.logging import getLogger
 from redbot.core.utils.chat_formatting import humanize_number, pagify
 from tabulate import tabulate
 
-HEADERS = {"User-Agent": f"Red-DiscordBot Trusty-cogs Runescape Cog"}
+from .helpers import HEADERS
+from .xp import ELITE_XP, XP_TABLE
 
-log = logging.getLogger("red.trusty-cogs.runescape")
+log = getLogger("red.trusty-cogs.runescape")
 
 
 class APIError(Exception):
@@ -123,6 +124,23 @@ class Skills(Enum):
     Divination = 25
     Invention = 26
     Archaeology = 27
+    Necromancy = 28
+
+    @property
+    def is_elite(self):
+        return self is Skills.Invention
+
+    @property
+    def is_120(self):
+        return self in (
+            Skills.Herblore,
+            Skills.Slayer,
+            Skills.Farming,
+            Skills.Dungeoneering,
+            Skills.Invention,
+            Skills.Archaeology,
+            Skills.Necromancy,
+        )
 
 
 class Item:
@@ -155,8 +173,12 @@ class Activity:
     @classmethod
     def from_json(cls, data: dict):
         tz = pytz.timezone("Europe/London")
-        date = datetime.strptime(data.get("date"), "%d-%b-%Y %H:%M")
-        date = tz.localize(date, is_dst=None).astimezone(timezone.utc)
+        date_info = data.get("date")
+        if date_info is not None:
+            date = datetime.strptime(date_info, "%d-%b-%Y %H:%M")
+        else:
+            date = datetime.now()
+        date = tz.localize(date)
         text = data.get("text")
         activity_id = f"{int(date.timestamp())}-{text}"
         return cls(
@@ -192,6 +214,30 @@ class Skill:
     rank: int
     id: int
     name: str
+    # sort of a pseudo cached property
+    _virtual_level: Optional[int] = None
+
+    def virtual_level(self) -> Optional[int]:
+        if self._virtual_level is not None:
+            return self._virtual_level
+        table = XP_TABLE
+        max_level = 120
+        if self.skill.is_elite:
+            table = ELITE_XP
+            max_level = 150
+        # since this is for virtual levels we can reduce iterations
+        # by just slicing the list to only values after the start of virtual
+        # level calculations. This should reduce our iterations from
+        # 120(150 for elite) per skill to only 22 (52 for elite) per skill
+        split = 99
+        for level, xp in enumerate(table[split - 1 :], start=split):
+            if self.xp >= xp:
+                self._virtual_level = min(level, max_level)
+        return self._virtual_level
+
+    @property
+    def skill(self):
+        return Skills(self.id)
 
     @classmethod
     def from_json(cls, data: dict):
@@ -285,6 +331,7 @@ class Profile:
     divination: Skill
     invention: Skill
     archaeology: Skill
+    necromancy: Skill
 
     def __str__(self):
         skills_list = [["Overall", self.totalskill, "{:,}".format(self.totalxp), self.rank]]
@@ -294,9 +341,12 @@ class Profile:
                 level = 1
                 xp = 0
                 rank = "Unranked"
-                skills_list.append([skill_name, level, xp, rank])
+                skills_list.append([skill_name.name, level, xp, rank])
                 continue
             level = skill.level
+            virtual = skill.virtual_level()
+            if virtual is not None and virtual != level:
+                level = f"{skill.level} ({virtual})"
             xp = skill.xp
             rank = "Unranked"
             if skill.rank:
@@ -375,10 +425,10 @@ class Profile:
     @classmethod
     def from_json(cls, data: dict):
         logged_in = True if data["loggedIn"] == "true" else False
+        skills = {skill.value: 0 for skill in Skills}
         if "skillvalues" in data:
-            skills = {skill["id"]: Skill.from_json(skill) for skill in data["skillvalues"]}
-        else:
-            skills = {skill.value: 0 for skill in Skills}
+            for skill in data["skillvalues"]:
+                skills[skill["id"]] = Skill.from_json(skill)
 
         return cls(
             name=data["name"],
@@ -422,6 +472,7 @@ class Profile:
             divination=skills[25],
             invention=skills[26],
             archaeology=skills[27],
+            necromancy=skills[28],
         )
 
     @classmethod
@@ -639,7 +690,7 @@ class OSRSProfile:
     @classmethod
     def from_str(cls, rsn: str, data: str) -> OSRSProfile:
         data = data.replace(" ", "\n")
-        log.info(data)
+        log.verbose("OSRSProfile from_str: %s", data)
         final_data: List[Union[str, OSRSRank]] = [rsn, data]
         for line_no, ranks in enumerate(data.split("\n")):
             if line_no >= len(cls._ORDER):
@@ -701,10 +752,9 @@ class OSRSProfile:
         activities_list = []
         data = data.replace(" ", "\n")
         for line, ranks in enumerate(data.split("\n")):
-
             if line >= len(OSRSProfile._ORDER):
                 continue
-            log.info(OSRSProfile._ORDER[line])
+            log.verbose("OSRSProfile table_from_text: %s", OSRSProfile._ORDER[line])
             rank = [int(i) for i in ranks.split(",")]
             if len(rank) == 3:
                 skills_list.append(

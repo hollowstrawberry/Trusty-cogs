@@ -1,7 +1,12 @@
-from .starboard import Starboard
-from redbot.core.utils import get_end_user_data_statement
+import json
+from pathlib import Path
 
-__red_end_user_data_statement__ = get_end_user_data_statement(__file__)
+from .starboard import Starboard
+
+with open(Path(__file__).parent / "info.json") as fp:
+    __red_end_user_data_statement__ = json.load(fp)["end_user_data_statement"]
+
 
 async def setup(bot):
-    await bot.add_cog(Starboard(bot))
+    cog = Starboard(bot)
+    await bot.add_cog(cog)

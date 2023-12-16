@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import logging
 import re
 from datetime import datetime, timedelta, timezone
 from enum import Enum
@@ -21,6 +20,7 @@ import discord
 import pytz
 from discord.ext.commands.converter import Converter
 from discord.ext.commands.errors import BadArgument
+from red_commons.logging import getLogger
 from redbot.core.bot import Red
 from redbot.core.commands import Context
 from redbot.core.data_manager import cog_data_path
@@ -38,7 +38,7 @@ if TYPE_CHECKING:
 
 _ = Translator("Hockey", __file__)
 
-log = logging.getLogger("red.trusty-cogs.Hockey")
+log = getLogger("red.trusty-cogs.Hockey")
 
 DATE_RE = re.compile(
     r"((19|20)\d\d)[- \/.](0[1-9]|1[012]|[1-9])[- \/.](0[1-9]|[12][0-9]|3[01]|[1-9])"
@@ -50,14 +50,25 @@ YEAR_RE = re.compile(r"((19|20)\d\d)-?\/?((19|20)\d\d)?")
 
 TIMEZONE_RE = re.compile(r"|".join(re.escape(zone) for zone in pytz.common_timezones), flags=re.I)
 
-ACTIVE_TEAM_RE_STR = r"|".join(
-    rf"{team}|{data['tri_code']}|{'|'.join(n for n in data['nickname'])}"
-    for team, data in TEAMS.items()
-    if data["active"]
-)
+
+ACTIVE_TEAM_RE_STR = r""
+for team, data in TEAMS.items():
+    if not data["active"]:
+        continue
+    nicks = "|".join(f"\b{n}\b" for n in data["nickname"])
+    ACTIVE_TEAM_RE_STR += rf"\b{team}\b|\b{data['tri_code']}\b|{nicks}"
+
 ACTIVE_TEAM_RE = re.compile(ACTIVE_TEAM_RE_STR, flags=re.I)
 
 VERSUS_RE = re.compile(r"vs\.?|versus", flags=re.I)
+
+
+class Broadcast(NamedTuple):
+    id: int
+    name: str
+    type: str
+    site: str
+    language: str
 
 
 def utc_to_local(utc_dt: datetime, new_timezone: str = "US/Pacific") -> datetime:
@@ -140,16 +151,16 @@ class TeamFinder(discord.app_commands.Transformer):
                 continue
             nick = data["nickname"]
             short = data["tri_code"]
-            pattern = fr"{short}\b|" + r"|".join(fr"\b{i}\b" for i in team.split())
+            pattern = rf"{short}\b|" + r"|".join(rf"\b{i}\b" for i in team.split())
             if nick:
-                pattern += r"|" + r"|".join(fr"\b{i}\b" for i in nick)
+                pattern += r"|" + r"|".join(rf"\b{i}\b" for i in nick)
             # log.debug(pattern)
-            reg: Pattern = re.compile(fr"\b{pattern}", flags=re.I)
+            reg: Pattern = re.compile(rf"\b{pattern}", flags=re.I)
             for pot in potential_teams:
                 find = reg.findall(pot)
                 if find:
-                    log.debug(reg)
-                    log.debug(find)
+                    log.verbose("TeamFinder reg: %s", reg)
+                    log.verbose("TeamFinder find: %s", find)
                     result.add(team)
         if include_all and "all" in argument:
             result.add("all")
@@ -187,7 +198,6 @@ class PlayerFinder(discord.app_commands.Transformer):
         path = cog_data_path(cog) / "players.json"
         await cls().check_and_download(cog)
         with path.open(encoding="utf-8", mode="r") as f:
-
             players = []
             async for player in AsyncIter(json.loads(f.read())["data"], steps=100):
                 if argument.lower() in player["fullName"].lower():
@@ -308,6 +318,8 @@ class TimezoneFinder(Converter):
 
 
 class LeaderboardType(Enum):
+    worst_playoffs = -2
+    worst_preseason = -1
     worst = 0
     preseason = 1
     preseason_weekly = 2
@@ -319,10 +331,73 @@ class LeaderboardType(Enum):
     last_week = 8
     playoffs_last_week = 9
 
+    @classmethod
+    def from_str(cls, name: str) -> LeaderboardType:
+        leaderboard_type = name.replace(" ", "_").lower()
+        if leaderboard_type in ("seasonal", "season"):
+            return LeaderboardType(3)
+        elif leaderboard_type in ("weekly", "week"):
+            return LeaderboardType(4)
+        elif leaderboard_type in ("playoffs", "playoff"):
+            return LeaderboardType(5)
+        elif leaderboard_type in ("playoffs_weekly", "playoff_weekly"):
+            return LeaderboardType(6)
+        elif leaderboard_type in ("pre-season", "preseason"):
+            return LeaderboardType(1)
+        elif leaderboard_type in ("pre-season_weekly", "preseason_weekly"):
+            return LeaderboardType(2)
+        elif leaderboard_type in ("worst",):
+            return LeaderboardType(0)
+        elif leaderboard_type in ("worst_playoffs",):
+            return LeaderboardType(-2)
+        elif leaderboard_type in ("worst_preseason", "worst_pre-season"):
+            return LeaderboardType(-1)
+        elif leaderboard_type in ("last_week",):
+            return LeaderboardType(8)
+        elif leaderboard_type in ("playoffs_last_week",):
+            return LeaderboardType(9)
+        elif leaderboard_type in ("pre-season_last_week", "preseason_last_week"):
+            return LeaderboardType(7)
+        else:
+            raise TypeError(_("`{name}` is not a valid leaderboard type.").format(name=name))
+
+    def is_standard(self):
+        return self in (
+            LeaderboardType.preseason,
+            LeaderboardType.season,
+            LeaderboardType.playoffs,
+        )
+
+    def is_last_week(self):
+        return self in (
+            LeaderboardType.preseason_last_week,
+            LeaderboardType.last_week,
+            LeaderboardType.playoffs_last_week,
+        )
+
+    def is_weekly(self):
+        return self in (
+            LeaderboardType.preseason_weekly,
+            LeaderboardType.weekly,
+            LeaderboardType.playoffs_weekly,
+            LeaderboardType.preseason_last_week,
+            LeaderboardType.last_week,
+            LeaderboardType.playoffs_last_week,
+        )
+
+    def is_worst(self):
+        return self.value <= 0
+
     def as_str(self) -> str:
         return self.name.replace("_", " ").replace("preseason", "pre-season")
 
     def key(self):
+        if self.value <= 0:
+            return {
+                LeaderboardType.worst: "season",
+                LeaderboardType.worst_preseason: "preseason",
+                LeaderboardType.worst_playoffs: "playoffs",
+            }.get(self, "season")
         if self.value < 7:
             return self.name.replace("preseason", "pre-season")
         elif self.value == 7:
@@ -332,33 +407,26 @@ class LeaderboardType(Enum):
         else:
             return "playoffs_weekly"
 
+    def total_key(self) -> str:
+        return {
+            LeaderboardType.season: "total",
+            LeaderboardType.playoffs: "playoffs_total",
+            LeaderboardType.preseason: "pre-season_total",
+            LeaderboardType.worst: "total",
+            LeaderboardType.worst_playoffs: "playoffs_total",
+            LeaderboardType.worst_preseason: "pre-season_total",
+        }.get(self, "total")
+
 
 class LeaderboardFinder(discord.app_commands.Transformer):
     @classmethod
     async def convert(self, ctx: Context, argument: str) -> LeaderboardType:
         if argument.isdigit():
             return LeaderboardType(int(argument))
-        leaderboard_type = argument.replace(" ", "_").lower()
-        if leaderboard_type in ["seasonal", "season"]:
-            return LeaderboardType(3)
-        if leaderboard_type in ["weekly", "week"]:
-            return LeaderboardType(4)
-        if leaderboard_type in ["playoffs", "playoff"]:
-            return LeaderboardType(5)
-        if leaderboard_type in ["playoffs_weekly", "playoff_weekly"]:
-            return LeaderboardType(6)
-        if leaderboard_type in ["pre-season", "preseason"]:
-            return LeaderboardType(1)
-        if leaderboard_type in ["pre-season_weekly", "preseason_weekly"]:
-            return LeaderboardType(2)
-        if leaderboard_type in ["worst"]:
-            return LeaderboardType(0)
-        if leaderboard_type in ["last_week"]:
-            return LeaderboardType(8)
-        if leaderboard_type in ["playoffs_last_week"]:
-            return LeaderboardType(9)
-        if leaderboard_type in ["pre-season_last_week", "preseason_last_week"]:
-            return LeaderboardType(7)
+        try:
+            return LeaderboardType.from_str(argument)
+        except TypeError:
+            pass
         return LeaderboardType(4)
 
     async def transform(self, interaction: discord.Interaction, argument: str) -> LeaderboardType:
@@ -368,19 +436,11 @@ class LeaderboardFinder(discord.app_commands.Transformer):
     async def autocomplete(
         self, interaction: discord.Interaction, argument: str
     ) -> List[discord.app_commands.Choice[str]]:
-        choices = [
-            discord.app_commands.Choice(name="Seasonal", value="season"),
-            discord.app_commands.Choice(name="Worst", value="worst"),
-            discord.app_commands.Choice(name="Playoffs", value="playoffs"),
-            discord.app_commands.Choice(name="Playoffs Weekly", value="playoffs_weekly"),
-            discord.app_commands.Choice(name="Pre-Season", value="pre-season"),
-            discord.app_commands.Choice(name="Pre-Season Weekly", value="pre-season_weekly"),
-            discord.app_commands.Choice(name="Weekly", value="weekly"),
-            discord.app_commands.Choice(name="Last Week", value="last_week"),
-            discord.app_commands.Choice(name="Playoffs Last Week", value="playoffs_last_week"),
-            discord.app_commands.Choice(name="Pre-season Last Week", value="pre-season_last_week"),
+        return [
+            discord.app_commands.Choice(name=i.as_str().title(), value=str(i.value))
+            for i in LeaderboardType
+            if argument.lower() in i.as_str().lower()
         ]
-        return choices
 
 
 class HockeyStates(Enum):
@@ -477,8 +537,27 @@ class StandingsFinder(discord.app_commands.Transformer):
         return choices
 
 
+def game_states_to_int(states: List[str]) -> List[int]:
+    ret = []
+    options = {
+        "Preview": [1, 2, 3, 4],
+        "Live": [5],
+        "Final": [9, 10, 11],
+        "Goal": [],
+        "Periodrecap": [6, 7, 8],
+    }
+    for state in states:
+        ret += options.get(state, [])
+    return ret
+
+
 async def check_to_post(
-    bot: Red, channel: discord.TextChannel, channel_data: dict, post_state: str, game_state: str
+    bot: Red,
+    channel: discord.TextChannel,
+    channel_data: dict,
+    post_state: List[str],
+    game_state: str,
+    is_goal: bool = False,
 ) -> bool:
     if channel is None:
         return False
@@ -487,7 +566,12 @@ async def check_to_post(
         await bot.get_cog("Hockey").config.channel(channel).team.clear()
         return False
     should_post = False
-    if game_state in channel_data["game_states"]:
+    state_ints = game_states_to_int(channel_data["game_states"])
+    if game_state.value in state_ints:
+        for team in channel_teams:
+            if team in post_state:
+                should_post = True
+    if is_goal and "Goal" in channel_data["game_states"]:
         for team in channel_teams:
             if team in post_state:
                 should_post = True
@@ -523,7 +607,16 @@ async def get_team(bot: Red, team: str, game_start: str, game_id: int = 0) -> di
     team_list = await config.teams()
     if team_list is None:
         team_list = []
-        team_entry = TeamEntry("Null", team, 0, [], {}, [], "", game_id)
+        team_entry = TeamEntry(
+            game_state=0,
+            team_name=team,
+            period=0,
+            channel=[],
+            goal_id={},
+            created_channel=[],
+            game_start=game_start,
+            game_id=game_id,
+        )
         team_list.append(team_entry.to_json())
         await config.teams.set(team_list)
     for teams in team_list:
@@ -534,7 +627,16 @@ async def get_team(bot: Red, team: str, game_start: str, game_id: int = 0) -> di
         ):
             return teams
     # Add unknown teams to the config to track stats
-    return_team = TeamEntry("Null", team, 0, [], {}, [], "", game_id)
+    return_team = TeamEntry(
+        game_state=0,
+        team_name=team,
+        period=0,
+        channel=[],
+        goal_id={},
+        created_channel=[],
+        game_start=game_start,
+        game_id=game_id,
+    )
     team_list.append(return_team.to_json())
     await config.teams.set(team_list)
     return return_team.to_json()
@@ -555,7 +657,7 @@ async def get_channel_obj(
         if not channel:
             # await bot.get_cog("Hockey").config.channel_from_id(channel_id).clear()
             # log.info(f"{channel_id} channel was removed because it no longer exists")
-            log.info(f"{channel_id} Could not be found")
+            log.info("%s Could not be found", channel_id)
             return None
         guild = channel.guild
         await bot.get_cog("Hockey").config.channel(channel).guild_id.set(guild.id)
@@ -564,13 +666,13 @@ async def get_channel_obj(
     if not guild:
         # await bot.get_cog("Hockey").config.channel_from_id(channel_id).clear()
         # log.info(f"{channel_id} channel was removed because it no longer exists")
-        log.info(f"{channel_id} Could not be found")
+        log.info("%s Could not be found", channel_id)
         return None
     channel = guild.get_channel(channel_id)
     thread = guild.get_thread(channel_id)
     if channel is None and thread is None:
         # await bot.get_cog("Hockey").config.channel_from_id(channel_id).clear()
         # log.info(f"{channel_id} channel was removed because it no longer exists")
-        log.info(f"{channel_id} Could not be found")
+        log.info("%s Could not be found", channel_id)
         return None
     return channel or thread

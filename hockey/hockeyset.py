@@ -1,24 +1,30 @@
-import logging
+import asyncio
+import os
+import re
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
+import aiohttp
 import discord
+from red_commons.logging import getLogger
 from redbot.core import commands
+from redbot.core.data_manager import cog_data_path
 from redbot.core.i18n import Translator
 from redbot.core.utils.chat_formatting import humanize_list
 
-from .abc import MixinMeta
+from .abc import HockeyMixin
 from .constants import TEAMS
 from .helper import StandingsFinder, StateFinder, TeamFinder
 from .standings import Conferences, Divisions, Standings
 
 _ = Translator("Hockey", __file__)
 
-log = logging.getLogger("red.trusty-cogs.Hockey")
+log = getLogger("red.trusty-cogs.Hockey")
 
-hockeyset_commands = MixinMeta.hockeyset_commands
+hockeyset_commands = HockeyMixin.hockeyset_commands
 
 
-class HockeySetCommands(MixinMeta):
+class HockeySetCommands(HockeyMixin):
     """
     All the commands grouped under `[p]hockeyset`
     """
@@ -32,8 +38,8 @@ class HockeySetCommands(MixinMeta):
         guild = ctx.guild
         standings_channel = guild.get_channel(await self.config.guild(guild).standings_channel())
         post_standings = _("On") if await self.config.guild(guild).post_standings() else _("Off")
-        gdc_channels = await self.config.guild(guild).gdc()
-        gdt_channels = await self.config.guild(guild).gdt()
+        gdc_channels = (await self.config.guild(guild).gdc_chans()).values()
+        gdt_channels = (await self.config.guild(guild).gdt_chans()).values()
         standings_chn = "None"
         standings_msg = "None"
         if gdc_channels is None:
@@ -110,6 +116,106 @@ class HockeySetCommands(MixinMeta):
         commands for enabling/disabling slash commands
         """
         pass
+
+    @commands.group(name="hockeyevents", aliases=["nhlevents"])
+    @commands.bot_has_permissions(manage_events=True)
+    @commands.admin_or_permissions(manage_guild=True)
+    @commands.guild_only()
+    async def hockey_events(self, ctx: commands.Context):
+        """
+        Commands for setting up discord guild events
+        """
+
+    @hockey_events.command(name="set")
+    @commands.bot_has_permissions(manage_events=True)
+    @commands.admin_or_permissions(manage_guild=True)
+    @commands.guild_only()
+    @commands.max_concurrency(1, commands.BucketType.guild)
+    async def set_team_events(self, ctx: commands.Context, team: TeamFinder):
+        """
+        Create a scheduled server event for all games in the season for one team.
+
+        This command can take a while to complete.
+        """
+        start = datetime.now()
+        end = start + timedelta(days=350)
+        try:
+            data = await self.api.get_schedule(
+                team, start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")
+            )
+        except aiohttp.ClientConnectorError:
+            await ctx.send(
+                _("There's an issue accessing the NHL API at the moment. Try again later.")
+            )
+            log.exception("Error accessing NHL API")
+            return
+        number_of_games = str(len(data.get("dates", [])))
+        await ctx.send(f"Creating events for {number_of_games} games.")
+        images_path = cog_data_path(self) / "teamlogos"
+        if not os.path.isdir(images_path):
+            os.mkdir(images_path)
+        existing_events = {}
+        for event in ctx.guild.scheduled_events:
+            event_id = re.search(r"\n(\d{6,})", event.description)
+            existing_events[event_id.group(1)] = event
+        async with ctx.typing():
+            for date in data["dates"]:
+                for game in date["games"]:
+                    start = datetime.strptime(game["gameDate"], "%Y-%m-%dT%H:%M:%SZ").replace(
+                        tzinfo=timezone.utc
+                    )
+                    end = start + timedelta(hours=3)
+                    away = game["teams"]["away"]["team"]["name"]
+                    home = game["teams"]["home"]["team"]["name"]
+                    image_team = away if team == home else home
+                    image_file = images_path / f"{image_team}.png"
+                    if not os.path.isfile(image_file):
+                        async with self.session.get(TEAMS[image_team]["logo"]) as resp:
+                            image = await resp.read()
+                        with image_file.open("wb") as outfile:
+                            outfile.write(image)
+                    image = open(image_file, "rb")
+                    name = f"{away} @ {home}"
+                    broadcasts = humanize_list(
+                        [b.get("name", "Unknown") for b in game.get("broadcasts", [])]
+                    )
+                    description = name
+                    if broadcasts:
+                        description += f"\nBroadcasts: {broadcasts}"
+                    game_id = str(game["gamePk"])
+                    description += f"\n\n{game_id}"
+                    if game_id in existing_events:
+                        try:
+                            if existing_events[game_id].start_time != start:
+                                await existing_events[game_id].edit(
+                                    start_time=start, end_time=end, reason="Start time changed"
+                                )
+                            if existing_events[game_id].description != description:
+                                await existing_events[game_id].edit(
+                                    description=description, reason="Description has changed"
+                                )
+                        except Exception:
+                            # I don't care if these don't edit properly
+                            pass
+                        continue
+                    try:
+                        await ctx.guild.create_scheduled_event(
+                            name=f"{away} @ {home}",
+                            description=description,
+                            start_time=start,
+                            location=game.get("venue", {}).get("name", "Unknown place"),
+                            end_time=end,
+                            entity_type=discord.EntityType.external,
+                            image=image.read(),
+                            privacy_level=discord.PrivacyLevel.guild_only,
+                        )
+                    except Exception:
+                        log.exception(
+                            "Error creating scheduled event in %s for team %s", ctx.guild.id, team
+                        )
+                    image.close()
+                    await asyncio.sleep(1)
+        await ctx.send(f"Finished creating events for {number_of_games} games.")
 
     @hockey_slash.command(name="global")
     @commands.is_owner()
@@ -455,13 +561,21 @@ class HockeySetCommands(MixinMeta):
             )
             await ctx.send(msg)
             return
-
-        standings = await Standings.get_team_standings(session=self.session)
+        try:
+            standings = await self.api.get_standings()
+        except aiohttp.ClientConnectorError:
+            await ctx.send(
+                _("There's an issue accessing the NHL API at the moment. Try again later.")
+            )
+            log.exception("Error accessing NHL API")
+            return
         if standings_type in [i.name.lower() for i in Divisions]:
-            em = await standings.make_division_standings_embed(standings_type)
+            standing = Divisions(standings_type.title())
+            em = await standings.make_division_standings_embed(standing)
 
         elif standings_type in [i.name.lower() for i in Conferences]:
-            em = await standings.make_conference_standings_embed(standings_type)
+            standing = Conferences(standings_type.title())
+            em = await standings.make_conference_standings_embed(standing)
         else:
             em = await standings.all_standing_embed()
         await self.config.guild(guild).standings_type.set(standings_type)
@@ -593,23 +707,22 @@ class HockeySetCommands(MixinMeta):
             await ctx.send(_("You must provide a valid current team."))
             return
         # team_data = await self.get_team(team)
-        if channel is None:
-            channel = ctx.channel
-        cur_teams = await self.config.channel(channel).team()
-        cur_teams = [] if cur_teams is None else cur_teams
-        if team in cur_teams:
-            # await self.config.channel(channel).team.set([team])
-            msg = _("{team} is already posting updates in {channel}").format(
-                team=team, channel=channel.mention
-            )
-            await ctx.send(msg)
-            return
-        else:
-            cur_teams.append(team)
-            await self.config.channel(channel).team.set(cur_teams)
-        msg = _("{team} goals will be posted in {channel}").format(
-            team=team, channel=channel.mention
-        )
+        async with ctx.typing():
+            if channel is None:
+                channel = ctx.channel
+            cur_teams = await self.config.channel(channel).team()
+            cur_teams = [] if cur_teams is None else cur_teams
+            if team in cur_teams:
+                # await self.config.channel(channel).team.set([team])
+                msg = _("{team} is already posting updates in {channel}").format(
+                    team=team, channel=channel.mention
+                )
+            else:
+                cur_teams.append(team)
+                await self.config.channel(channel).team.set(cur_teams)
+                msg = _("{team} goals will be posted in {channel}").format(
+                    team=team, channel=channel.mention
+                )
         await ctx.send(msg)
 
     @hockeyset_commands.command(name="remove", aliases=["del", "rem", "delete"])
@@ -624,35 +737,31 @@ class HockeySetCommands(MixinMeta):
         Removes a teams goal updates from a channel
         defaults to the current channel
         """
-        await ctx.defer()
         if channel is None:
             channel = ctx.channel
-        cur_teams = await self.config.channel(channel).team()
-        if not cur_teams:
-            msg = _("No teams are currently being posted in {channel}.").format(
-                channel=channel.mention
-            )
-            await ctx.send(msg)
-            return
-        if team is None:
-            await self.config.channel(channel).clear()
-            msg = _("No game updates will be posted in {channel}.").format(channel=channel.mention)
-            await ctx.send(msg)
-            return
+        msg = _("No teams are currently being posted in {channel}.").format(
+            channel=channel.mention
+        )
+        async with ctx.typing():
+            cur_teams = await self.config.channel(channel).team()
+            if team is None:
+                await self.config.channel(channel).clear()
+                msg = _("No game updates will be posted in {channel}.").format(
+                    channel=channel.mention
+                )
 
-        if team is not None:
-            # guild = ctx.message.guild
-            if team in cur_teams:
-                cur_teams.remove(team)
-                if cur_teams == []:
-                    await self.config.channel(channel).clear()
-                    msg = _("No game updates will be posted in {channel}.").format(
-                        channel=channel.mention
-                    )
-                    await ctx.send(msg)
-                else:
-                    await self.config.channel(channel).team.set(cur_teams)
-                    msg = _("{team} goal updates removed from {channel}.").format(
-                        team=team, channel=channel.mention
-                    )
-                    await ctx.send(msg)
+            if team is not None:
+                # guild = ctx.message.guild
+                if team in cur_teams:
+                    cur_teams.remove(team)
+                    if cur_teams == []:
+                        await self.config.channel(channel).clear()
+                        msg = _("No game updates will be posted in {channel}.").format(
+                            channel=channel.mention
+                        )
+                    else:
+                        await self.config.channel(channel).team.set(cur_teams)
+                        msg = _("{team} goal updates removed from {channel}.").format(
+                            team=team, channel=channel.mention
+                        )
+        await ctx.send(msg)

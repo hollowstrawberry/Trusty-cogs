@@ -1,6 +1,5 @@
 import asyncio
 import functools
-import logging
 import random
 import re
 import sys
@@ -11,12 +10,13 @@ from typing import List, Optional, Pattern, Tuple
 import aiohttp
 import discord
 from PIL import Image, ImageColor, ImageDraw, ImageFont
+from red_commons.logging import getLogger
 from redbot.core import Config, commands
 from redbot.core.data_manager import bundled_data_path, cog_data_path
 
 from .converter import Stamp
 
-log = logging.getLogger("red.trusty-cogs.bingo")
+log = getLogger("red.trusty-cogs.bingo")
 
 IMAGE_LINKS: Pattern = re.compile(
     r"(https?:\/\/[^\"\'\s]*\.(?:png|jpg|jpeg)(\?size=[0-9]*)?)", flags=re.I
@@ -24,8 +24,7 @@ IMAGE_LINKS: Pattern = re.compile(
 
 
 class Bingo(commands.Cog):
-
-    __version__ = "1.2.0"
+    __version__ = "1.2.1"
     __author__ = ["TrustyJAID"]
 
     def __init__(self, bot):
@@ -223,7 +222,7 @@ class Bingo(commands.Cog):
         """
         if member is None:
             await self.config.clear_all_members(guild=ctx.guild)
-            await ctx.send("Reseting everyone's bingo card.")
+            await ctx.send("Resetting everyone's bingo card.")
         else:
             await self.config.member(member).clear()
             await ctx.send(
@@ -439,7 +438,7 @@ class Bingo(commands.Cog):
         credit_font = ImageFont.truetype(font=font_path, size=10)
         draw.text(
             (690, 975),
-            f"Bingo Cog written by TrustyJAID#0001\nBingo card colours and images provided by {guild_name} moderators",
+            f"Bingo Cog written by @trustyjaid\nBingo card colours and images provided by {guild_name} moderators",
             fill=text_colour,
             stroke_width=1,
             align="right",
@@ -481,7 +480,7 @@ class Bingo(commands.Cog):
                 font=font,
             )
             letter_count += 1
-        log.info(name)
+        log.trace("_create_bingo_card name: %s", name)
         draw.text(
             (350, 200),
             name,
@@ -509,7 +508,7 @@ class Bingo(commands.Cog):
                     count += 1
                 draw.rectangle((x0, y0, x1, y1), outline=box_colour)
                 if [x, y] in stamps or [x, y] == [2, 2]:
-                    log.info(f"Filling square {x} {y}")
+                    log.info("Filling square %s %s", x, y)
                     colour = list(ImageColor.getrgb(stamp_colour))
                     colour.append(128)
                     nb = base.copy()
@@ -521,7 +520,7 @@ class Bingo(commands.Cog):
                     text = text[:57] + "..."
 
                 lines = textwrap.wrap(text, width=13)
-                font_height = font2.getsize(text)[1]
+                font_height = font2.getbbox(text)[3] - font2.getbbox(text)[1]
                 text_x = x0 + int(scale / 2)
                 if len(lines) > 1:
                     text_y = y0 + (int(scale / 2) - ((len(lines) / 3) * font_height))

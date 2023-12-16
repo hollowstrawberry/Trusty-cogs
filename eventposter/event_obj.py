@@ -1,4 +1,3 @@
-import logging
 import re
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple, Union, cast
@@ -10,12 +9,13 @@ from dateutil.tz import gettz
 from discord.ext.commands.converter import Converter
 from discord.ext.commands.errors import BadArgument
 from discord.utils import snowflake_time
+from red_commons.logging import getLogger
 from redbot.core import Config, commands
 from redbot.core.bot import Red
 from redbot.core.i18n import Translator, cog_i18n
 from redbot.core.utils.chat_formatting import humanize_list, humanize_timedelta, pagify
 
-log = logging.getLogger("red.trusty-cogs.EventPoster")
+log = getLogger("red.trusty-cogs.EventPoster")
 
 _ = Translator("EventPoster", __file__)
 
@@ -37,6 +37,27 @@ TIME_RE_STRING = r"|".join(
     ]
 )
 TIME_RE = re.compile(TIME_RE_STRING, re.I)
+
+
+class WrongView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=180)
+        self.approved = True
+        self.message: Optional[discord.Message] = None
+
+    async def on_timeout(self):
+        if self.message is not None:
+            await self.message.edit(view=None)
+
+    @discord.ui.button(label=_("This looks wrong"), style=discord.ButtonStyle.red)
+    async def end_event(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.stop()
+        self.approved = False
+        if self.message is not None:
+            await self.message.edit(view=None)
+        await interaction.response.send_message(
+            _("This event has been cancelled. Feel free to try again.")
+        )
 
 
 class ApproveButton(discord.ui.Button):
@@ -76,6 +97,7 @@ class ApproveView(discord.ui.View):
         await interaction.response.defer()
         event = self.cog.waiting_approval[interaction.message.id]["event"]
         ctx = self.cog.waiting_approval[interaction.message.id]["ctx"]
+        self.cog.waiting_approval[interaction.message.id]["wrongview"].stop()
         event.approver = interaction.user.id
         try:
             await self.cog.post_event(ctx, event)
@@ -372,7 +394,7 @@ class Event(discord.ui.View):
         self.add_item(self.maybe_button)
         self.add_item(self.leave_button)
         self.select_view = None
-        log.debug(self.select_options)
+        log.trace("Event select_options: %s", self.select_options)
         if self.select_options:
             self.select_view = PlayerClassSelect(
                 custom_id=f"playerclass-{self.hoster}",
@@ -388,11 +410,11 @@ class Event(discord.ui.View):
         if self.max_slots and len(self.members) >= self.max_slots:
             self.join_button.disabled = True
             self.select_view.disabled = True
-            log.debug(f"Setting Join Button to {self.join_button.disabled}")
+            log.trace("Setting Join Button to %s", self.join_button.disabled)
         if self.max_slots and len(self.members) < self.max_slots:
             self.join_button.disabled = False
             self.select_view.disabled = False
-            log.debug(f"Setting Join Button to {self.join_button.disabled}")
+            log.debug("Setting Join Button to %s", self.join_button.disabled)
 
     async def interaction_check(self, interaction: discord.Interaction):
         """
@@ -445,14 +467,14 @@ class Event(discord.ui.View):
             return True
         if self.start:
             future = (self.start + timedelta(seconds=seconds)).timestamp()
-            log.debug(f"{humanize_timedelta(seconds = future-now)}")
+            log.verbose("should_remove self.start %s", humanize_timedelta(seconds=future - now))
             return now > future
         else:
             future = (
                 snowflake_time(self.message).replace(tzinfo=timezone.utc)
                 + timedelta(seconds=seconds)
             ).timestamp()
-            log.debug(f"{humanize_timedelta(seconds = future-now)}")
+            log.verbose("should_remove else %s", humanize_timedelta(seconds=future - now))
             return now > future
 
     def remaining(self, seconds: int) -> str:
@@ -467,7 +489,7 @@ class Event(discord.ui.View):
         if self.start:
             future = (self.start + timedelta(seconds=seconds)).timestamp()
             diff = future - now
-            log.debug(f"Set time {future=} {now=} {diff=}")
+            log.debug("Set time self.start future=%s now=%s diff=%s", future, now, diff)
             return humanize_timedelta(seconds=future - now)
         else:
             future = (
@@ -475,7 +497,7 @@ class Event(discord.ui.View):
                 + timedelta(seconds=seconds)
             ).timestamp()
             diff = future - now
-            log.debug(f"Message Time {future=} {now=} {diff=}")
+            log.debug("Message Time ellse future=%s now=%s diff=%s", future, now, diff)
             return humanize_timedelta(seconds=future - now)
 
     async def update_event(self):
@@ -551,7 +573,7 @@ class Event(discord.ui.View):
         hoster = ctx.guild.get_member(self.hoster)
         em = discord.Embed()
         em.set_author(
-            name=_("{hoster} is hosting").format(hoster=hoster), icon_url=hoster.avatar.url
+            name=_("{hoster} is hosting").format(hoster=hoster), icon_url=hoster.display_avatar
         )
         try:
             prefixes = await self.bot.get_valid_prefixes(ctx.guild)
@@ -565,13 +587,15 @@ class Event(discord.ui.View):
             if slots < 0:
                 slots = 0
             max_slots_msg = _("**{slots} slots available.**").format(slots=slots)
-
+        cog = ctx.bot.get_cog("EventPoster")
+        command_name = cog.join_event.qualified_name
         em.description = _(
             "**{description}**\n\nTo join this event type "
-            "`{prefix}join {hoster}` or press the Join Event button below.\n\n"
+            "`{prefix}{command_name} {hoster}` or press the Join Event button below.\n\n"
             "**{max_slots_msg}**"
         ).format(
             description=self.event[:1024],
+            command_name=command_name,
             prefix=prefix,
             hoster=hoster,
             max_slots_msg=max_slots_msg,
@@ -613,21 +637,42 @@ class Event(discord.ui.View):
             approver = ctx.guild.get_member(self.approver)
             em.set_footer(
                 text=_("Approved by {approver}").format(approver=approver),
-                icon_url=approver.avatar.url,
+                icon_url=approver.display_avatar,
             )
         start = await self.start_time()
         if start is not None:
             em.timestamp = start
 
+        thumbnail = await self.get_thumbnail(ctx)
+        if thumbnail:
+            em.set_thumbnail(url=thumbnail)
+        image = await self.get_image(ctx)
+        if image:
+            em.set_image(url=image)
+        return em
+
+    def get_config(self):
+        return Config.get_conf(None, identifier=144014746356678656, cog_name="EventPoster")
+
+    async def get_thumbnail(self, ctx: Optional[commands.Context]) -> Optional[str]:
+        if ctx is None:
+            ctx = await self.get_ctx(self.bot)
+        config = self.get_config()
         thumbnails = await config.guild(ctx.guild).custom_links()
         for name, link in thumbnails.items():
-            if name.lower() in self.event.lower():
-                em.set_thumbnail(url=link)
-        images = await config.guild(ctx.guild).large_links()
-        for name, link in images.items():
-            if name.lower() in self.event.lower():
-                em.set_image(url=link)
-        return em
+            if re.search(rf"(?i)\b{name}\b", self.event):
+                return link
+        return None
+
+    async def get_image(self, ctx: Optional[commands.Context]) -> Optional[str]:
+        if ctx is None:
+            ctx = await self.get_ctx(self.bot)
+        config = self.get_config()
+        large_links = await config.guild(ctx.guild).large_links()
+        for name, link in large_links.items():
+            if re.search(rf"(?i)\b{name}\b", self.event):
+                return link
+        return None
 
     @classmethod
     def from_json(cls, bot: Red, data: dict):
@@ -635,7 +680,7 @@ class Event(discord.ui.View):
         new_members = []
         for m in members:
             if isinstance(m, tuple) or isinstance(m, list):
-                log.debug(f"Converting to new members list in {data.get('channel')}")
+                log.debug("Converting to new members list in %s", data.get("channel"))
                 new_members.append(m[0])
             else:
                 new_members.append(m)
@@ -645,7 +690,8 @@ class Event(discord.ui.View):
         guild = data.get("guild")
         if not guild:
             chan = bot.get_channel(data.get("channel"))
-            guild = chan.guild.id
+            if chan:
+                guild = chan.guild.id
         return cls(
             bot=bot,
             hoster=data.get("hoster"),

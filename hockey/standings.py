@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -10,6 +9,7 @@ from typing import TYPE_CHECKING, Dict, List, Literal, NamedTuple, Optional, Uni
 
 import aiohttp
 import discord
+from red_commons.logging import getLogger
 from redbot.core.i18n import Translator
 from redbot.core.utils import AsyncIter
 from redbot.vendored.discord.ext import menus
@@ -31,13 +31,19 @@ if TYPE_CHECKING:
 
 _ = Translator("Hockey", __file__)
 
-log = logging.getLogger("red.trusty-cogs.Hockey")
+log = getLogger("red.trusty-cogs.Hockey")
 
 
 class StreakType(Enum):
     ot = "ot"
     wins = "wins"
     losses = "losses"
+
+    @classmethod
+    def from_code(cls, code: str) -> StreakType:
+        return {"W": StreakType.wins, "L": StreakType.losses, "OT": StreakType.ot}.get(
+            code, StreakType.wins
+        )
 
 
 @dataclass
@@ -62,7 +68,10 @@ class Streak:
     streakCode: str
 
     def __init__(self, *args, **kwargs):
-        self.streakType = StreakType(kwargs["streakType"])
+        try:
+            self.streakType = StreakType(kwargs["streakType"])
+        except ValueError:
+            self.streakType = StreakType.from_code(kwargs["streakCode"])
         self.streakNumber = int(kwargs["streakNumber"])
         self.streakCode = kwargs["streakCode"]
 
@@ -423,11 +432,17 @@ class TeamRecord:
 
     @property
     def gaa(self):
-        return self.goals_against / self.games_played
+        try:
+            return self.goals_against / self.games_played
+        except ZeroDivisionError:
+            return 0.0
 
     @property
     def gpg(self):
-        return self.goals_scored / self.games_played
+        try:
+            return self.goals_scored / self.games_played
+        except ZeroDivisionError:
+            return 0.0
 
     @classmethod
     def from_json(cls, data: dict, division: Division, conference: Conference) -> TeamRecord:
@@ -465,6 +480,61 @@ class TeamRecord:
             last_updated=datetime.strptime(data["lastUpdated"], "%Y-%m-%dT%H:%M:%SZ"),
         )
 
+    @classmethod
+    def from_nhle(cls, data: dict) -> TeamRecord:
+        team_name = data["teamName"].get("default")
+        team_info = TEAMS.get(team_name)
+        team = Team(id=team_info["id"], name=team_name, link=team_info["team_url"])
+        division = Division(
+            id=0,
+            name=data["divisionName"],
+            nameShort="",
+            abbreviation=data["divisionAbbrev"],
+            link=None,
+        )
+        conference = Conference(id=0, name=data["conferenceName"], link=None)
+        league_record = LeagueRecord(
+            wins=data["wins"], losses=data["losses"], ot=data["otLosses"], type="league"
+        )
+        streak = Streak(
+            **{
+                "streakType": "wins",
+                "streakNumber": data["streakCount"],
+                "streakCode": data["streakCode"],
+            }
+        )
+        return cls(
+            team=team,
+            division=division,
+            conference=conference,
+            league_record=league_record,
+            regulation_wins=int(data["regulationWins"]),
+            goals_against=int(data["goalAgainst"]),
+            goals_scored=int(data["goalFor"]),
+            points=int(data["points"]),
+            division_rank=int(data["divisionSequence"]),
+            division_l10_rank=int(data["divisionL10Sequence"]),
+            division_road_rank=int(data["divisionRoadSequence"]),
+            division_home_rank=int(data["divisionHomeSequence"]),
+            conference_rank=int(data["conferenceSequence"]),
+            conference_l10_rank=int(data["conferenceL10Sequence"]),
+            conference_road_rank=int(data["conferenceRoadSequence"]),
+            conference_home_rank=int(data["conferenceHomeSequence"]),
+            league_rank=int(data["leagueSequence"]),
+            league_l10_rank=int(data["leagueL10Sequence"]),
+            league_road_rank=int(data["leagueRoadSequence"]),
+            league_home_rank=int(data["leagueHomeSequence"]),
+            wildcard_rank=int(data["wildcardSequence"]),
+            row=0,
+            games_played=int(data["gamesPlayed"]),
+            streak=streak,
+            points_percentage=float(data["pointPctg"]),
+            pp_division_rank=0,
+            pp_conference_rank=0,
+            pp_league_rank=0,
+            last_updated=datetime.now(timezone.utc),
+        )
+
 
 class Standings:
     def __init__(self, records: dict = {}):
@@ -489,6 +559,14 @@ class Standings:
             if record.last_updated > latest:
                 latest = record.last_updated
         return latest or datetime.now(timezone.utc)
+
+    @classmethod
+    def from_nhle(cls, data: dict) -> Standings:
+        all_records = {}
+        for team in data["standings"]:
+            record = TeamRecord.from_nhle(team)
+            all_records[record.team.name] = record
+        return cls(records=all_records)
 
     @classmethod
     async def get_team_standings(
@@ -524,17 +602,17 @@ class Standings:
         run when new games for the day is updated
         """
         log.debug("Updating Standings.")
-        config = bot.get_cog("Hockey").config
-        standings = await Standings.get_team_standings()
+        cog = bot.get_cog("Hockey")
+        config = cog.config
+        standings = await cog.api.get_standings()
 
         all_guilds = await config.all_guilds()
         async for guild_id, data in AsyncIter(all_guilds.items(), steps=100):
             guild = bot.get_guild(guild_id)
             if guild is None:
                 continue
-            log.debug(guild.name)
+            log.verbose("post_automatic_standings, guild name: ", guild.name)
             if data["post_standings"]:
-
                 search = data["standings_type"]
                 if search is None:
                     continue

@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 import discord
+from red_commons.logging import getLogger
 from redbot.core.bot import Red
 from redbot.core.i18n import Translator
 from redbot.core.utils import AsyncIter
@@ -14,16 +14,16 @@ from .constants import HEADSHOT_URL, TEAMS
 from .helper import check_to_post, get_channel_obj, get_team
 
 if TYPE_CHECKING:
+    from .api import GoalData
     from .game import Game
 
 
 _ = Translator("Hockey", __file__)
 
-log = logging.getLogger("red.trusty-cogs.Hockey")
+log = getLogger("red.trusty-cogs.Hockey")
 
 
 class Goal:
-
     goal_id: str
     team_name: str
     scorer_id: int
@@ -66,6 +66,7 @@ class Goal:
         self.tasks: List[asyncio.Task] = []
         self.home_shots: int = kwargs.get("home_shots", 0)
         self.away_shots: int = kwargs.get("away_shots", 0)
+        self.situation = kwargs.get("situation")
 
     def __repr__(self):
         return "<Hockey Goal team={0.team_name} id={0.goal_id} >".format(self)
@@ -91,6 +92,10 @@ class Goal:
             "home_shots": self.home_shots,
             "away_shots": self.away_shots,
         }
+
+    @classmethod
+    def from_data(cls, data: GoalData):
+        return cls(**data)
 
     @staticmethod
     def get_image_and_highlight_url(
@@ -215,7 +220,9 @@ class Goal:
                 continue
             if channel.guild.me.is_timed_out():
                 continue
-            should_post = await check_to_post(bot, channel, data, post_state, "Goal")
+            should_post = await check_to_post(
+                bot, channel, data, post_state, game_data.game_state, True
+            )
             if should_post:
                 post_data.append(
                     await self.actually_post_goal(bot, channel, goal_embed, goal_text)
@@ -234,7 +241,7 @@ class Goal:
         try:
             guild = channel.guild
             if not channel.permissions_for(guild.me).send_messages:
-                log.debug("No permission to send messages in %s", repr(channel))
+                log.debug("No permission to send messages in %r", channel)
                 return None
 
             config = bot.get_cog("Hockey").config
@@ -266,7 +273,7 @@ class Goal:
             except Exception:
                 log.error("Error trying to find montreal goal role")
             if goal_notifications:
-                log.debug(goal_notifications)
+                log.debug("actually_post_goal goal_notifications: %s", goal_notifications)
                 allowed_mentions = {"allowed_mentions": discord.AllowedMentions(roles=True)}
             else:
                 allowed_mentions = {"allowed_mentions": discord.AllowedMentions(roles=False)}
@@ -450,34 +457,40 @@ class Goal:
         """
         home_msg = ""
         away_msg = ""
-        score = "☑ {scorer}\n"
-        miss = "❌ {scorer}\n"
-        players = game.home_roster
-        players.update(game.away_roster)
+        score = "\N{WHITE HEAVY CHECK MARK} {scorer}\n"
+        miss = "\N{CROSS MARK} {scorer}\n"
+
         for goal in game.home_goals:
             scorer = ""
             scorer_num = ""
-            if goal.time > self.time:
-                break
-            if f"ID{goal.scorer_id}" in players:
-                scorer = players[f"ID{goal.scorer_id}"]["person"]["fullName"]
-            if goal.event in ["Shot", "Missed Shot"] and goal.period_ord == "SO":
+            if goal.period_ord != "SO":
+                continue
+            if goal.goal_id > self.goal_id:
+                continue
+            if goal.scorer_id in game.home_roster:
+                scorer = game.home_roster[goal.scorer_id].name
+            if goal.event in ["Shot", "Missed Shot"]:
                 home_msg += miss.format(scorer=scorer)
-            if goal.event in ["Goal"] and goal.period_ord == "SO":
+            if goal.event in ["Goal"]:
                 home_msg += score.format(scorer=scorer)
 
         for goal in game.away_goals:
             scorer = ""
-            if goal.time > self.time:
+            if goal.period_ord != "SO":
+                continue
+            if goal.goal_id > self.goal_id:
                 # if the goal object building this shootout display
                 # is in the shootout and we reach a goal that happened *after*
                 # this goal object, we break for a cleaner looking shootout display.
-                break
-            if f"ID{goal.scorer_id}" in players:
-                scorer = players[f"ID{goal.scorer_id}"]["person"]["fullName"]
-            if goal.event in ["Shot", "Missed Shot"] and goal.period_ord == "SO":
+
+                # addendum, the new API removed timestamps so for this to work
+                # we have to assume that goal ID's increment
+                continue
+            if goal.scorer_id in game.away_roster:
+                scorer = game.away_roster[goal.scorer_id].name
+            if goal.event in ["Shot", "Missed Shot"]:
                 away_msg += miss.format(scorer=scorer)
-            if goal.event in ["Goal"] and goal.period_ord == "SO":
+            if goal.event in ["Goal"]:
                 away_msg += score.format(scorer=scorer)
 
         return home_msg, away_msg
@@ -489,7 +502,7 @@ class Goal:
         # h_emoji = game.home_emoji
         # a_emoji = game.away_emoji
         shootout = False
-        if game.period_ord == "SO":
+        if self.period_ord == "SO":
             shootout = True
         colour = (
             int(TEAMS[self.team_name]["home"].replace("#", ""), 16)
@@ -501,10 +514,9 @@ class Goal:
         url = TEAMS[self.team_name]["team_url"] if self.team_name in TEAMS else "https://nhl.com"
         logo = TEAMS[self.team_name]["logo"] if self.team_name in TEAMS else "https://nhl.com"
         if not shootout:
-
-            em = discord.Embed(description=f"{self.description}\n<t:{self.timestamp}:T>")
+            em = discord.Embed(description=f"{self.description}")
             if self.link:
-                em.description = f"[{self.description}\n<t:{self.timestamp}:T>]({self.link})"
+                em.description = f"[{self.description}]({self.link})"
             if colour is not None:
                 em.colour = colour
             em.set_author(name=title, url=url, icon_url=logo)
@@ -540,13 +552,12 @@ class Goal:
             if away_msg:
                 em.add_field(name=game.away_team, value=away_msg)
             em.set_footer(
-                text=str(game.period_time_left)
-                + _(" left in the ")
-                + str(game.period_ord)
-                + _(" period"),
+                text=_("{time} left in the {ordinal} period").format(
+                    time=str(game.period_time_left), ordinal=str(self.period_ord)
+                ),
                 icon_url=logo,
             )
-            em.timestamp = self.time
+            # em.timestamp = self.time
         return em
 
     async def goal_post_text(self, game: Game) -> str:

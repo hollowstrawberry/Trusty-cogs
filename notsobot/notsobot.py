@@ -1,7 +1,6 @@
 # https://github.com/NotSoSuper/NotSoBot
 
 import asyncio
-import logging
 import os
 import random
 import re
@@ -9,7 +8,7 @@ import sys
 import textwrap
 import uuid
 from io import BytesIO
-from typing import List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 from urllib.parse import quote
 
 import aiohttp
@@ -22,13 +21,14 @@ import wand.color
 import wand.drawing
 from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageSequence
 from pyfiglet import figlet_format
+from red_commons.logging import getLogger
 from redbot.core import commands
 from redbot.core.data_manager import bundled_data_path, cog_data_path
 
 from .converter import ImageFinder
 from .vw import macintoshplus
 
-log = logging.getLogger("red.trusty-cogs.NotSoBot")
+log = getLogger("red.trusty-cogs.NotSoBot")
 
 try:
     import aalib
@@ -94,7 +94,7 @@ class NotSoBot(commands.Cog):
     """
 
     __author__ = ["NotSoSuper", "TrustyJAID"]
-    __version__ = "2.5.4"
+    __version__ = "2.5.5"
 
     def __init__(self, bot):
         self.bot = bot
@@ -223,6 +223,15 @@ class NotSoBot(commands.Cog):
         else:
             return None
 
+    async def get_headers(self, url: str) -> Dict[str, str]:
+        headers = {}
+        if "imgur.com" in url:
+            tokens = await self.bot.get_shared_api_tokens("imgur")
+            if "client_id" in tokens:
+                client_id = tokens["client_id"]
+                headers["Authorization"] = f"Client-ID {client_id}"
+        return headers
+
     async def bytes_download(
         self, url: Union[discord.Asset, discord.Attachment, str]
     ) -> Tuple[Union[BytesIO, bool], Union[str, bool]]:
@@ -242,7 +251,8 @@ class NotSoBot(commands.Cog):
 
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.get(url) as resp:
+                headers = await self.get_headers(url)
+                async with session.get(url, headers=headers) as resp:
                     if resp.status == 200:
                         data = await resp.read()
                         mime = resp.headers.get("Content-type", "").lower()
@@ -250,6 +260,9 @@ class NotSoBot(commands.Cog):
                         b.seek(0)
                         return b, mime
                     else:
+                        log.error(
+                            "%s HTTP Response Error downloading image from %s", resp.status, url
+                        )
                         return False, False
         except asyncio.TimeoutError:
             return False, False
@@ -340,7 +353,7 @@ class NotSoBot(commands.Cog):
                 if len(getattr(img, "sequence", [])) > 1:
                     is_gif = True
                 if is_gif:
-                    log.debug("Is gif")
+                    log.verbose("Is gif")
                     for change in img.sequence:
                         change.transform(resize="512x512")
                         change.liquid_rescale(
@@ -361,7 +374,7 @@ class NotSoBot(commands.Cog):
                     # for i in range(len(img.sequence)):
                     # with img.sequence[i] as change:
                 else:
-                    log.debug("Is not gif")
+                    log.verbose("Is not gif")
                     for x in range(0, 30):
                         if x == 0:
                             log.debug("Cloning initial image")
@@ -580,7 +593,22 @@ class NotSoBot(commands.Cog):
         avatar = urls[0]
         async with ctx.typing():
             img, mime = await self.bytes_download(str(avatar))
-            trig, mime = await self.bytes_download("https://i.imgur.com/zDAY2yo.jpg")
+            img_path = cog_data_path(self) / "triggered.jpg"
+            if not os.path.isfile(img_path) or os.path.getsize(img_path) == 0:
+                url = "https://i.imgur.com/zDAY2yo.jpg"
+                trig, mime = await self.bytes_download(url)
+                if trig is not False:
+                    with img_path.open("wb") as outfile:
+                        outfile.write(trig.read())
+                else:
+                    await ctx.send(
+                        "There was an error downloading the triggered template. "
+                        "If you are the bot owner check your logs for instructions to fix this."
+                    )
+                    log.info("Please visit %s and save this image at `%s`.", url, img_path)
+                    return
+            with img_path.open("rb") as infile:
+                trig = BytesIO(infile.read())
             if img is False or trig is False:
                 await ctx.send(":warning: **Command download function failed...**")
                 return
@@ -612,11 +640,13 @@ class NotSoBot(commands.Cog):
             img = ImageDraw.Draw(i)
             txt = figlet_format(text, font="starwars")
             img.text((20, 20), figlet_format(text, font="starwars"), fill=(0, 255, 0))
-            text_width, text_height = img.textsize(figlet_format(text, font="starwars"))
+            size = img.textbbox((0, 0), figlet_format(text, font="starwars"))
+            text_width, text_height = (size[2] - size[0], size[3] - size[1])
             imgs = Image.new("RGB", (text_width + 30, text_height))
             ii = ImageDraw.Draw(imgs)
             ii.text((20, 20), figlet_format(text, font="starwars"), fill=(0, 255, 0))
-            text_width, text_height = ii.textsize(figlet_format(text, font="starwars"))
+            size = ii.textbbox((0, 0), figlet_format(text, font="starwars"))
+            text_width, text_height = (size[2] - size[0], size[3] - size[1])
             final = BytesIO()
             imgs.save(final, "png")
             file_size = final.tell()
@@ -627,7 +657,8 @@ class NotSoBot(commands.Cog):
             imgs.close()
             return file, txt, file_size
         except Exception:
-            return False, False
+            log.exception("Error making ascii text")
+            return False, False, False
 
     @commands.command(aliases=["expand"])
     @commands.cooldown(1, 5)
@@ -796,16 +827,27 @@ class NotSoBot(commands.Cog):
             name = ctx.message.author.name
         if len(ctx.message.mentions) >= 1:
             name = ctx.message.mentions[0].name
-        b, mime = await self.bytes_download("https://i.imgur.com/xNWxZHn.jpg")
-        if b is False:
-            await ctx.send(":warning: **Command download function failed...**")
-            return
+        # b, mime = await self.bytes_download()
+        img_path = cog_data_path(self) / "rip.jpg"
+        if not os.path.isfile(img_path) or os.path.getsize(img_path) == 0:
+            url = "https://i.imgur.com/xNWxZHn.jpg"
+            img, mime = await self.bytes_download(url)
+            if img is not False:
+                with img_path.open("wb") as outfile:
+                    outfile.write(img.read())
+            else:
+                await ctx.send(
+                    "There was an error downloading the triggered template. "
+                    "If you are the bot owner check your logs for instructions to fix this."
+                )
+                log.info("Please visit %s and save this image at `%s`.", url, img_path)
+                return
+        with img_path.open("rb") as infile:
+            image = BytesIO(infile.read())
         if not text:
             text = f"{name}'s\n Hopes and Dreams"
         else:
             text = f"{name}\n{text}"
-        if not b:
-            return
 
         def make_rip(image, text):
             img = Image.open(image).convert("RGB")
@@ -813,7 +855,8 @@ class NotSoBot(commands.Cog):
             font_path = f"{str(bundled_data_path(self))}{os.sep}arial.ttf"
             font1 = ImageFont.truetype(font_path, 35)
             text = "\n".join(line for line in textwrap.wrap(text, width=15))
-            w, h = draw.multiline_textsize(text, font=font1)
+            size = draw.multiline_textbbox((0, 0), text, font=font1)
+            w = size[2] - size[1]
             draw.multiline_text(
                 (((400 - w) / 2) - 1, 50), text, fill=(50, 50, 50), font=font1, align="center"
             )
@@ -837,11 +880,10 @@ class NotSoBot(commands.Cog):
             file = discord.File(final, filename=filename)
             final.close()
             img.close()
-            b.close()
             return file, file_size
 
         loop = asyncio.get_running_loop()
-        task = loop.run_in_executor(None, make_rip, b, text)
+        task = loop.run_in_executor(None, make_rip, image, text)
         try:
             file, file_size = await asyncio.wait_for(task, timeout=60)
         except asyncio.TimeoutError:
@@ -870,7 +912,7 @@ class NotSoBot(commands.Cog):
             count = 0
             list_im = []
             for url in urls:
-                log.debug(url)
+                log.verbose("merge url: %s", url)
                 count += 1
                 b, mime = await self.bytes_download(str(url))
                 if sys.getsizeof(b) == 215:
@@ -1022,16 +1064,27 @@ class NotSoBot(commands.Cog):
             log.error("Error in vaporwave: ", exc_info=True)
             return await ctx.send("That image cannot be vaporwaved.")
         await self.safe_send(ctx, None, file, file_size)
-        b.close()
 
     @commands.command(aliases=["achievement"])
     @commands.bot_has_permissions(attach_files=True)
     async def minecraftachievement(self, ctx, *, txt: str):
         """Generate a Minecraft Achievement"""
-        b, mime = await self.bytes_download("https://i.imgur.com/JtNJFZy.png")
-        if b is False:
-            await ctx.send(":warning: **Command download function failed...**")
-            return
+        img_path = cog_data_path(self) / "achievement.png"
+        if not os.path.isfile(img_path) or os.path.getsize(img_path) == 0:
+            url = "https://i.imgur.com/JtNJFZy.png"
+            img, mime = await self.bytes_download(url)
+            if img is not False:
+                with img_path.open("wb") as outfile:
+                    outfile.write(img.read())
+            else:
+                await ctx.send(
+                    "There was an error downloading the triggered template. "
+                    "If you are the bot owner check your logs for instructions to fix this."
+                )
+                log.info("Please visit %s and save this image at `%s`.", url, img_path)
+                return
+        with img_path.open("rb") as infile:
+            image = BytesIO(infile.read())
         if len(txt) > 20:
             txt = txt[:20] + " ..."
 
@@ -1053,14 +1106,13 @@ class NotSoBot(commands.Cog):
 
         try:
             loop = asyncio.get_running_loop()
-            task = loop.run_in_executor(None, make_mc, b, txt)
+            task = loop.run_in_executor(None, make_mc, image, txt)
             file, file_size = await asyncio.wait_for(task, timeout=60)
         except asyncio.TimeoutError:
             return await ctx.send("That image is too large.")
         except Exception:
             return await ctx.send("I cannot make that minecraft achievement.")
         await self.safe_send(ctx, None, file, file_size)
-        b.close()
 
     @commands.command(aliases=["wm"])
     @commands.bot_has_permissions(attach_files=True)
@@ -1106,7 +1158,22 @@ class NotSoBot(commands.Cog):
             ):
                 return await ctx.send("That is not a valid image.")
             if mark == "brazzers" or mark is None:
-                wmm, mime = await self.bytes_download("https://i.imgur.com/YAb1RMZ.png")
+                img_path = cog_data_path(self) / "brazzers.png"
+                if not os.path.isfile(img_path) or os.path.getsize(img_path) == 0:
+                    url = "https://i.imgur.com/YAb1RMZ.png"
+                    img, mime = await self.bytes_download(url)
+                    if img is not False:
+                        with img_path.open("wb") as outfile:
+                            outfile.write(img.read())
+                    else:
+                        await ctx.send(
+                            "There was an error downloading the triggered template. "
+                            "If you are the bot owner check your logs for instructions to fix this."
+                        )
+                        log.info("Please visit %s and save this image at `%s`.", url, img_path)
+                        return
+                with img_path.open("rb") as infile:
+                    wmm = BytesIO(infile.read())
                 if wmm is False or b is False:
                     await ctx.send(":warning: **Command download function failed...**")
                     return

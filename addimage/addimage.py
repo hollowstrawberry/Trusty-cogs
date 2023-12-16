@@ -1,5 +1,4 @@
 import asyncio
-import logging
 import os
 import random
 import string
@@ -7,14 +6,14 @@ from pathlib import Path
 from typing import Literal, Optional, cast
 
 import discord
-from redbot import VersionInfo, version_info
-from redbot.core import Config, VersionInfo, checks, commands, version_info
+from red_commons.logging import getLogger
+from redbot.core import Config, checks, commands
 from redbot.core.data_manager import cog_data_path
 from redbot.core.i18n import Translator, cog_i18n
 from redbot.core.utils.menus import DEFAULT_CONTROLS, menu
 
 _ = Translator("AddImage", __file__)
-log = logging.getLogger("red.Trusty-cogs.addimage")
+log = getLogger("red.Trusty-cogs.addimage")
 
 
 @cog_i18n(_)
@@ -60,7 +59,8 @@ class AddImage(commands.Cog):
                         os.remove(cog_data_path(self) / str(guild_id) / image["file_loc"])
                     except Exception:
                         log.error(
-                            _("Error deleting image {image}").format(image=image["file_loc"]),
+                            "Error deleting image %s",
+                            image["file_loc"],
                             exc_info=True,
                         )
                         pass
@@ -178,27 +178,8 @@ class AddImage(commands.Cog):
         """
         https://github.com/Cog-Creators/Red-DiscordBot/blob/V3/release/3.0.0/redbot/cogs/mod/mod.py#L1273
         """
-        if version_info >= VersionInfo.from_str("3.3.6"):
-            ctx = await self.bot.get_context(message)
-            return await self.bot.ignored_channel_or_guild(ctx)
-        channel = cast(discord.TextChannel, message.channel)
-        guild = cast(discord.Guild, channel.guild)
-        author = cast(discord.Member, message.author)
-        mod = self.bot.get_cog("Mod")
-        if mod is None:
-            return True
-        perms = channel.permissions_for(author)
-        surpass_ignore = (
-            isinstance(channel, discord.abc.PrivateChannel)
-            or perms.manage_guild
-            or await self.bot.is_owner(author)
-            or await self.bot.is_admin(author)
-        )
-        if surpass_ignore:
-            return True
-        guild_ignored = await mod.settings.guild(guild).ignored()
-        chann_ignored = await mod.settings.channel(channel).ignored()
-        return not (guild_ignored or chann_ignored and not perms.manage_channels)
+        ctx = await self.bot.get_context(message)
+        return await self.bot.ignored_channel_or_guild(ctx)
 
     @commands.Cog.listener()
     async def on_message(self, message):
@@ -208,9 +189,8 @@ class AddImage(commands.Cog):
         msg = message.content
         guild = message.guild
         channel = message.channel
-        if version_info >= VersionInfo.from_str("3.4.0"):
-            if await self.bot.cog_disabled_in_guild(self, guild):
-                return
+        if await self.bot.cog_disabled_in_guild(self, guild):
+            return
         try:
             prefix = await self.get_prefix(message)
         except ValueError:
@@ -329,7 +309,7 @@ class AddImage(commands.Cog):
                     + "**{}**".format(image["count"])
                 )
                 em.add_field(name=image["command_name"], value=info)
-            em.set_author(name=self.bot.user.display_name, icon_url=self.bot.user.avatar_url)
+            em.set_author(name=self.bot.user.display_name, icon_url=self.bot.user.display_avatar)
             em.set_footer(
                 text=_("Page ") + "{}/{}".format(post_list.index(post) + 1, len(post_list))
             )
@@ -405,9 +385,7 @@ class AddImage(commands.Cog):
         try:
             os.remove(cog_data_path(self) / str(guild.id) / image["file_loc"])
         except Exception:
-            log.error(
-                _("Error deleting image {image}").format(image=image["file_loc"]), exc_info=True
-            )
+            log.error("Error deleting image %s", image["file_loc"], exc_info=True)
             pass
         await self.config.guild(guild).images.set(all_imgs)
         await ctx.send(name + _(" has been deleted from this guild!"))
@@ -433,9 +411,7 @@ class AddImage(commands.Cog):
         try:
             os.remove(cog_data_path(self) / "global" / image["file_loc"])
         except Exception:
-            log.error(
-                _("Error deleting image {image}").format(image=image["file_loc"]), exc_info=True
-            )
+            log.error("Error deleting image %s", image["file_loc"], exc_info=True)
             pass
         await self.config.images.set(all_imgs)
         await ctx.send(name + _(" has been deleted globally!"))

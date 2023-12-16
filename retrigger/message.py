@@ -41,6 +41,8 @@ class ReTriggerMessage(discord.Message):
         self.pinned = False
         # suport for attachments somehow later maybe?
         self.attachments: List[discord.Attachment] = message.attachments
+        # support for embed search
+        self.embeds = message.embeds
         # mentions
         self.mention_everyone = self.channel.permissions_for(
             self.author
@@ -60,4 +62,5 @@ class ReTriggerMessage(discord.Message):
         self.role_mentions: List[discord.Role] = list(
             filter(None, [self.guild.get_role(idx) for idx in self.raw_role_mentions])
         )
+        self.webhook_id = None
         self.retrigger = True

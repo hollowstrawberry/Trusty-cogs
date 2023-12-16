@@ -11,6 +11,7 @@ import os
 import string
 import xml.dom
 
+from red_commons.logging import getLogger
 from redbot.core.data_manager import bundled_data_path
 
 try:
@@ -31,7 +32,7 @@ try:
 except NameError:
     _strbase = str
 
-log = logging.getLogger("red.Trusty-cogs.badges")
+log = getLogger("red.Trusty-cogs.badges")
 
 
 def mm2px(mm, dpi=300):
@@ -410,7 +411,8 @@ else:
 
         def _paint_text(self, xpos, ypos):
             font = ImageFont.truetype(self.FONT, self.font_size * 2)
-            width, height = font.getsize(self.text)
+            top, left, bottom, right = font.getbbox(text=self.text)
+            width, height = (bottom - top, right - left)
             pos = (mm2px(xpos, self.dpi) - width // 2, mm2px(ypos, self.dpi) - height // 4)
             self._draw.text(pos, self.text, font=font, fill=self.foreground)
 
@@ -424,7 +426,6 @@ else:
 
 
 class Barcode(object):
-
     name = ""
 
     raw = None

@@ -1,6 +1,5 @@
 import asyncio
 import json
-import logging
 from abc import ABC
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -9,14 +8,15 @@ from typing import Any, Dict, List, Literal, Optional
 import aiohttp
 import discord
 import yaml
+from red_commons.logging import getLogger
 from redbot.core import Config, commands
 from redbot.core.i18n import Translator, cog_i18n
 from redbot.core.utils import AsyncIter
 
+from .api import GameState, NewAPI, Schedule
 from .constants import BASE_URL, CONFIG_ID, CONTENT_URL, HEADSHOT_URL, TEAMS
 from .dev import HockeyDev
 from .errors import InvalidFileError
-from .game import Game
 from .gamedaychannels import GameDayChannels
 from .gamedaythreads import GameDayThreads
 from .helper import utc_to_local
@@ -25,11 +25,10 @@ from .hockeypickems import HockeyPickems
 from .hockeyset import HockeySetCommands
 from .pickems import Pickems
 from .standings import Standings
-from .teamentry import TeamEntry
 
 _ = Translator("Hockey", __file__)
 
-log = logging.getLogger("red.trusty-cogs.Hockey")
+log = getLogger("red.trusty-cogs.Hockey")
 
 
 class CompositeMetaClass(type(commands.Cog), type(ABC)):
@@ -56,7 +55,7 @@ class Hockey(
     Gather information and post goal updates for NHL hockey teams
     """
 
-    __version__ = "3.3.0"
+    __version__ = "4.0.0"
     __author__ = ["TrustyJAID"]
 
     def __init__(self, bot):
@@ -83,6 +82,8 @@ class Hockey(
             "gdt_channel": None,
             "gdc": [],
             "gdt": [],
+            "gdc_chans": {},
+            "gdt_chans": {},
             "delete_gdc": True,
             "update_gdt": True,
             "rules": "",
@@ -130,6 +131,7 @@ class Hockey(
             base_credits=0,
             top_credits=0,
             top_amount=0,
+            show_count=True,
         )
         self.pickems_config.register_global(
             base_credits=0,
@@ -137,6 +139,7 @@ class Hockey(
             top_amount=0,
             allowed_guilds=[],
             only_allowed=False,
+            unavailable_msg=None,
         )
         self.loop: Optional[asyncio.Task] = None
         self.TEST_LOOP = False
@@ -149,13 +152,23 @@ class Hockey(
         self._ready: asyncio.Event = asyncio.Event()
         # self._ready is used to prevent pickems from opening
         # data from the wrong file location
+        self._repo = ""
+        self._commit = ""
+        self.api = NewAPI()
 
     def format_help_for_context(self, ctx: commands.Context) -> str:
         """
         Thanks Sinbad!
         """
         pre_processed = super().format_help_for_context(ctx)
-        return f"{pre_processed}\n\nCog Version: {self.__version__}"
+        ret = f"{pre_processed}\n\n- Cog Version: {self.__version__}\n"
+        # we'll only have a repo if the cog was installed through Downloader at some point
+        if self._repo:
+            ret += f"- Repo: {self._repo}\n"
+        # we should have a commit if we have the repo but just incase
+        if self._commit:
+            ret += f"- Commit: [{self._commit[:9]}]({self._repo}/tree/{self._commit})"
+        return ret
 
     async def cog_unload(self):
         try:
@@ -166,14 +179,20 @@ class Hockey(
         if self.loop is not None:
             self.loop.cancel()
         await self.session.close()
+        await self.api.close()
         self.pickems_loop.cancel()
-        count = 0
-        while self.pickems_loop.is_being_cancelled():
-            if count > 10:
-                log.error("Pickems took more than 10 seconds to finish closing its loop.")
-                break
-            await asyncio.sleep(1)
-            count += 1
+        await self.after_pickems_loop()
+
+    async def _get_commit(self):
+        downloader = self.bot.get_cog("Downloader")
+        if not downloader:
+            return
+        cogs = await downloader.installed_cogs()
+        for cog in cogs:
+            if cog.name == "hockey":
+                if cog.repo is not None:
+                    self._repo = cog.repo.clean_url
+                self._commit = cog.commit
 
     async def red_delete_data_for_user(
         self,
@@ -189,12 +208,17 @@ class Hockey(
                     data["leaderboard"]
                 )
 
-    async def cog_load(self) -> None:
+    async def add_cog_to_dev_env(self):
+        await self.bot.wait_until_red_ready()
         if 218773382617890828 in self.bot.owner_ids:
             try:
                 self.bot.add_dev_env_value("hockey", lambda x: self)
             except Exception:
                 pass
+        await self._get_commit()
+
+    async def cog_load(self) -> None:
+        asyncio.create_task(self.add_cog_to_dev_env())
         self.loop = asyncio.create_task(self.game_check_loop())
         await self.migrate_settings()
 
@@ -252,13 +276,13 @@ class Hockey(
                     await self.config.guild_from_id(int(guild_id)).leaderboard.clear()
                 except Exception:
                     pass
-                log.info(f"Migrating leaderboard for {guild_id}")
+                log.info("Migrating leaderboard for %s", guild_id)
             if data.get("pickems"):
                 try:
                     await self.config.guild_from_id(int(guild_id)).pickems.clear()
                 except Exception:
                     pass
-                log.info(f"Migrating pickems for {guild_id}")
+                log.info("Migrating pickems for %s", guild_id)
             if data.get("pickems_channels"):
                 if not isinstance(data["pickems_channels"], list):
                     # this is just because I don't care but should get it working
@@ -269,7 +293,7 @@ class Hockey(
                     await self.config.guild_from_id(int(guild_id)).pickems_channels.clear()
                 except Exception:
                     pass
-                log.info(f"Migrating pickems channels for {guild_id}")
+                log.info("Migrating pickems channels for %s", guild_id)
             if data.get("pickems_category"):
                 await self.pickems_config.guild_from_id(int(guild_id)).pickems_category.set(
                     data["pickems_category"]
@@ -278,7 +302,7 @@ class Hockey(
                     await self.config.guild_from_id(int(guild_id)).pickems_category.clear()
                 except Exception:
                     pass
-                log.info(f"Migrating pickems categories for {guild_id}")
+                log.info("Migrating pickems categories for %s", guild_id)
 
     ##############################################################################
     # Here is all the logic for gathering game data and updating information     #
@@ -295,19 +319,16 @@ class Hockey(
         await self._ready.wait()
         while True:
             try:
-                async with self.session.get(f"{BASE_URL}/api/v1/schedule") as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                    else:
-                        log.info("Error checking schedule. %s", resp.status)
-                        await asyncio.sleep(30)
-                        continue
+                schedule = await self.api.get_schedule()
+                if schedule.days == []:
+                    await asyncio.sleep(30)
+                    continue
             except aiohttp.client_exceptions.ClientConnectorError:
                 # this will most likely happen if there's a temporary failure in name resolution
                 # this ends up calling the check_new_day earlier than expected causing
                 # game day channels and pickems to fail to update prpoperly
                 # continue after waiting 30 seconds should prevent that.
-                data = {"dates": []}
+                schedule = Schedule([])
                 await asyncio.sleep(30)
                 continue
             except Exception:
@@ -315,13 +336,13 @@ class Hockey(
                 data = {"dates": []}
                 await asyncio.sleep(60)
                 continue
-            if data["dates"] != []:
-                for game in data["dates"][0]["games"]:
-                    if game["status"]["abstractGameState"] == "Final":
+            if schedule.days != []:
+                for game in schedule.days[0]:
+                    if game.game_state.value >= GameState.final.value:
                         continue
-                    if game["status"]["detailedState"] == "Postponed":
+                    if game.schedule_state != "OK":
                         continue
-                    self.current_games[game["link"]] = {
+                    self.current_games[game.id] = {
                         "count": 0,
                         "game": None,
                         "disabled_buttons": False,
@@ -333,7 +354,7 @@ class Hockey(
                 await self.check_new_day()
             if self.TEST_LOOP:
                 self.current_games = {
-                    "https://statsapi.web.nhl.com/api/v1/game/2020020474/feed/live": {
+                    2020020474: {
                         "count": 0,
                         "game": None,
                         "disabled_buttons": False,
@@ -342,44 +363,44 @@ class Hockey(
             while self.current_games != {}:
                 self.games_playing = True
                 to_delete = []
-                for link, data in self.current_games.items():
+                for game_id, data in self.current_games.items():
                     if data["game"] is not None:
                         await self.fix_pickem_game_start(data["game"])
                     if data["game"] is not None and data["game"].game_start - timedelta(
                         hours=1
                     ) >= datetime.now(timezone.utc):
-                        log.debug(
+                        log.trace(
                             "Skipping %s @ %s checks until closer to game start.",
                             data["game"].away_team,
                             data["game"].home_team,
                         )
                         continue
-                    data = await self.get_game_data(link)
+                    data = await self.api.get_game_from_id(game_id)
                     if data is None:
                         continue
                     try:
-                        game = await Game.from_json(data)
-                        self.current_games[link]["game"] = game
+                        game = await self.api.get_game_from_id(game_id)
+                        self.current_games[game_id]["game"] = game
                     except Exception:
                         log.exception("Error creating game object from json.")
                         continue
                     try:
                         await self.check_new_day()
                         posted_final = await game.check_game_state(
-                            self.bot, self.current_games[link]["count"]
+                            self.bot, self.current_games[game_id]["count"]
                         )
                     except Exception:
                         log.exception("Error checking game state: ")
                         posted_final = False
                     if (
-                        game.game_state in ["Live"]
-                        and not self.current_games[link]["disabled_buttons"]
+                        game.game_state.is_live()
+                        and not self.current_games[game_id]["disabled_buttons"]
                     ):
-                        log.debug("Disabling buttons for %r", game)
+                        log.verbose("Disabling buttons for %r", game)
                         await self.disable_pickems_buttons(game)
-                        self.current_games[link]["disabled_buttons"] = True
+                        self.current_games[game_id]["disabled_buttons"] = True
 
-                    log.debug(
+                    log.trace(
                         "%s @ %s %s %s - %s",
                         game.away_team,
                         game.home_team,
@@ -388,14 +409,14 @@ class Hockey(
                         game.home_score,
                     )
 
-                    if game.game_state in ["Final", "Postponed"]:
-                        self.current_games[link]["count"] += 1
-                        if posted_final:
+                    if game.game_state.value > GameState.over.value:
+                        self.current_games[game_id]["count"] += 1
+                        if posted_final or game.game_state is GameState.official_final:
                             try:
                                 await self.set_guild_pickem_winner(game, edit_message=True)
                             except Exception:
                                 log.exception("Pickems Set Winner error: ")
-                            self.current_games[link]["count"] = 21
+                            self.current_games[game_id]["count"] = 21
                     await asyncio.sleep(1)
 
                 for link in self.current_games:
@@ -403,7 +424,7 @@ class Hockey(
                         to_delete.append(link)
                 for link in to_delete:
                     del self.current_games[link]
-                if not self.TEST_LOOP:
+                if not self.api.testing:
                     await asyncio.sleep(60)
                 else:
                     await asyncio.sleep(10)

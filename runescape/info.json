@@ -8,11 +8,11 @@
     "hidden": false,
     "install_msg": "Thanks for installing.",
     "max_bot_version": "0.0.0",
-    "min_bot_version": "3.5.0.dev363",
+    "min_bot_version": "3.5.0",
     "min_python_version": [
         3,
-        7,
-        2
+        9,
+        0
     ],
     "name": "runescape",
     "permissions": [
@@ -21,7 +21,8 @@
     "required_cogs": {},
     "requirements": [
         "tabulate",
-        "pytz"
+        "pytz",
+        "matplotlib"
     ],
     "short": "Show your Runescape stats in discord!",
     "tags": [
